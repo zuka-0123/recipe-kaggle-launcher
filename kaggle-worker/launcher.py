@@ -58,18 +58,37 @@ def public_repository(repository, github_token):
         raise LaunchError('public_repository_required')
 
 
+def status_failure_code(diagnostic):
+    """Return only an HTTP status; never expose Kaggle stderr or credentials."""
+    statuses = r'(401|403|404|429|5\d\d)'
+    patterns = [
+        r'\b' + statuses + r'\s+(?:Client|Server)\s+Error\b',
+        r'\bHTTP(?:\s+(?:status|error))?\s*[:=(]?\s*' + statuses + r'\b',
+        r'\b(?:status|response)(?:\s+code)?\s*[:=(]?\s*' + statuses + r'\b',
+        r'\bApiException\s*:\s*\(' + statuses + r'\)',
+        r'\b' + statuses + r'\s*[-:]\s*(?:Unauthorized|Forbidden|Not\s*Found|Too\s+Many\s+Requests|Internal\s+Server\s+Error|Bad\s+Gateway|Service\s+Unavailable|Gateway\s+Timeout)\b',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, diagnostic, re.I)
+        if match:
+            return 'kaggle_status_http_' + match.group(1)
+    return 'kaggle_status_unavailable'
+
+
 def kernel_status(reference):
     """Unknown/auth errors fail closed; a clear 404 permits first private push."""
     try:
         result = subprocess.run(['kaggle', 'kernels', 'status', reference],
             capture_output=True, text=True, timeout=60, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        raise LaunchError('kaggle_status_unavailable') from None
+    except OSError:
+        raise LaunchError('kaggle_status_oserror') from None
+    except subprocess.TimeoutExpired:
+        raise LaunchError('kaggle_status_timeout') from None
     if result.returncode != 0:
         diagnostic = (result.stdout or '') + '\n' + (result.stderr or '')
         if re.search(r'\b404\b[^\n]{0,60}\bnot\s*found\b', diagnostic, re.I):
             return 'missing'
-        raise LaunchError('kaggle_status_unavailable')
+        raise LaunchError(status_failure_code(diagnostic))
     match = re.search(r'(?:status\s*[:=]\s*|status\s+)["\']?([a-z_]+)', result.stdout, re.I)
     status = match.group(1).lower() if match else ''
     if status in ACTIVE_STATUSES:

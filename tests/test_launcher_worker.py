@@ -78,6 +78,25 @@ class LauncherTests(unittest.TestCase):
             with self.subTest(diagnostic=diagnostic), patch.object(launcher.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stdout='', stderr=diagnostic)), self.assertRaises(launcher.LaunchError):
                 launcher.kernel_status('owner/recipe-worker')
 
+    def test_status_error_reports_only_safe_http_code(self):
+        for status, message in [(401, '401 Client Error: Unauthorized'), (403, '403 - Forbidden'),
+                (429, 'ApiException: (429)'), (500, 'HTTP status: 500'), (503, 'response code: 503')]:
+            diagnostic = message + ' at https://private.example/token-secret'
+            with self.subTest(status=status), patch.object(launcher.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stdout='', stderr=diagnostic)):
+                with self.assertRaises(launcher.LaunchError) as captured:
+                    launcher.kernel_status('owner/recipe-worker')
+                self.assertEqual(captured.exception.code, f'kaggle_status_http_{status}')
+                self.assertNotIn('token-secret', str(captured.exception))
+        self.assertEqual(launcher.status_failure_code('credential contains 403 but no HTTP status'), 'kaggle_status_unavailable')
+
+    def test_status_timeout_and_oserror_have_safe_distinct_codes(self):
+        for error, code in [(OSError('private path'), 'kaggle_status_oserror'),
+                (launcher.subprocess.TimeoutExpired('private cmd', 60), 'kaggle_status_timeout')]:
+            with self.subTest(code=code), patch.object(launcher.subprocess, 'run', side_effect=error):
+                with self.assertRaises(launcher.LaunchError) as captured:
+                    launcher.kernel_status('owner/recipe-worker')
+                self.assertEqual(captured.exception.code, code)
+
     def test_urls_do_not_redirect_credentials(self):
         self.assertIsNone(launcher.NoRedirect().redirect_request(None, None, None, None, None, None))
         for url in ['http://recipe.example', 'https://token@recipe.example', 'https://recipe.example/api', 'https://recipe.example/?x=1']:
