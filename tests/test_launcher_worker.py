@@ -1,6 +1,7 @@
 """CPU-only contract tests. Models, network and Kaggle submission are mocked."""
 import datetime as dt
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
@@ -125,6 +126,25 @@ class WorkerTests(unittest.TestCase):
         data['batch_id'] = '../other'
         with self.assertRaises(AppError):
             worker.BatchAPI(data)
+
+    def test_six_large_japanese_inputs_fit_batch_response_limit(self):
+        payload = json.dumps({'jobs': [{'input': {'value': '材' * 120000}} for _ in range(6)]}, ensure_ascii=False).encode()
+        self.assertGreater(len(payload), 2 * 1024 * 1024)
+        opener = types.SimpleNamespace(open=lambda *args, **kwargs: io.BytesIO(payload))
+        with patch.object(worker.urllib.request, 'build_opener', return_value=opener):
+            batch = worker.BatchAPI(claim()).request()
+        self.assertEqual(len(batch['jobs']), 6)
+
+    def test_runtime_reserves_three_minutes_before_token_expiry(self):
+        class FakeAPI:
+            expires = __import__('time').time() + 1000
+            def __init__(self, config): pass
+            def request(self, suffix='', payload=None):
+                return {'batch_id': 'batch-1', 'jobs': [], 'schema': {},
+                    'config': {'max_batch_seconds': 3600}, 'extraction_prompt': 'rules'} if suffix == '' else {}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(worker, 'BatchAPI', FakeAPI), patch.object(worker, 'Models') as models, patch.object(worker, 'check_gpu', side_effect=AppError('gpu_unavailable', 'GPUなし')):
+            worker.run(claim(), Path(temporary))
+        self.assertEqual(models.call_args.args[-1], FakeAPI.expires - 180)
 
     def test_invalid_candidate_title_does_not_crash_fallback_decision(self):
         self.assertTrue(worker.needs_more({'title': 'wrong type', 'ingredients': [{}], 'steps': [{}]}))

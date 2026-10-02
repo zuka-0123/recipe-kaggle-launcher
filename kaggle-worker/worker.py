@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from workerlib.errors import AppError
 
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_BATCH_JSON_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_CHARS = 160_000
 
 
@@ -69,7 +70,7 @@ class BatchAPI:
         request = urllib.request.Request(self.url + suffix,
             headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'},
             data=None if payload is None else json.dumps(payload, ensure_ascii=False, allow_nan=False).encode())
-        maximum = MAX_IMAGE_BYTES if binary else 2 * 1024 * 1024
+        maximum = MAX_IMAGE_BYTES if binary else MAX_BATCH_JSON_BYTES
         for attempt in range(3):
             try:
                 with urllib.request.build_opener(NoRedirect()).open(request, timeout=40) as response:
@@ -377,7 +378,8 @@ def run(config, root):
     api.request('/start', {})
     settings = settings_from(batch['config'], root)
     maximum = min(int(batch['config'].get('max_batch_seconds', 5400)), 5400)
-    deadline = min(time.time() + maximum, api.expires - 60)
+    # Leave time for bounded HTTP retries and the final result/finish callbacks.
+    deadline = min(time.time() + maximum, api.expires - 180)
     rules = batch.get('extraction_prompt')
     if not isinstance(rules, str) or not rules.strip():
         for job in jobs:
