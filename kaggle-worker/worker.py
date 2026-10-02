@@ -46,6 +46,40 @@ SAFE_STAGES = {'dependency_install', 'worker_run', 'failure_report',
 SAFE_NETWORK_REASON_CLASSES = {'gaierror', 'SSLCertVerificationError', 'SSLError',
     'ConnectionRefusedError', 'ConnectionResetError', 'ConnectionAbortedError',
     'TimeoutError', 'OSError', 'str'}
+SAFE_HTTP_RESPONSE_KINDS = {'edge_challenge', 'cloudflare_html', 'application_json', 'html_other', 'http_other'}
+SAFE_APPLICATION_ERROR_CODES = {'unauthorized', 'not_found', 'batch_not_found', 'invalid_json',
+    'invalid_batch', 'batch_expired', 'worker_token_expired', 'batch_already_claimed',
+    'batch_already_finished', 'validation_failed', 'internal_error'}
+
+
+def classify_http_error(error):
+    """Read a small response locally and return only fixed diagnostic labels."""
+    headers = error.headers or {}
+    if str(headers.get('cf-mitigated', '')).lower() == 'challenge':
+        return {'response_kind': 'edge_challenge'}
+    try:
+        body = error.read(16 * 1024)
+    except Exception:
+        body = b''
+    content_type = str(headers.get('content-type', '')).lower()
+    if 'application/json' in content_type:
+        result = {'response_kind': 'application_json'}
+        try:
+            data = json.loads(body)
+            code = data.get('error', {}).get('code') if isinstance(data, dict) and isinstance(data.get('error'), dict) else data.get('code') if isinstance(data, dict) else None
+            if isinstance(code, str) and code in SAFE_APPLICATION_ERROR_CODES:
+                result['application_error_code'] = code
+        except (ValueError, TypeError):
+            pass
+        return result
+    lowered = body.lower()
+    if 'text/html' in content_type:
+        if b'cloudflare' in lowered and (b'just a moment' in lowered or b'cf-chl-' in lowered):
+            return {'response_kind': 'edge_challenge'}
+        if b'cloudflare' in lowered and (b'ray id' in lowered or b'cloudflare ray' in lowered or b'attention required' in lowered):
+            return {'response_kind': 'cloudflare_html'}
+        return {'response_kind': 'html_other'}
+    return {'response_kind': 'http_other'}
 
 
 def network_reason_class(error):
@@ -53,7 +87,7 @@ def network_reason_class(error):
     return value if value in SAFE_NETWORK_REASON_CLASSES else None
 
 
-def safe_diagnostic(stage, error, code=None, http_status=None):
+def safe_diagnostic(stage, error, code=None, http_status=None, response_details=None):
     """Only fixed labels, exception class and numeric HTTP status reach stdout."""
     stage = stage if stage in SAFE_STAGES else 'worker_run'
     details = error.details if isinstance(error, AppError) else {}
@@ -68,6 +102,13 @@ def safe_diagnostic(stage, error, code=None, http_status=None):
     reason = details.get('reason_class') or network_reason_class(error)
     if reason in SAFE_NETWORK_REASON_CLASSES:
         line += ' reason_class=' + reason
+    response_details = response_details or details
+    response_kind = response_details.get('response_kind')
+    if response_kind in SAFE_HTTP_RESPONSE_KINDS:
+        line += ' response_kind=' + response_kind
+    application_code = response_details.get('application_error_code')
+    if application_code in SAFE_APPLICATION_ERROR_CODES:
+        line += ' application_error_code=' + application_code
     print(line, flush=True)
 
 
@@ -162,9 +203,10 @@ class BatchAPI:
                     return body if binary else json.loads(body)
             except urllib.error.HTTPError as error:
                 if error.code not in [429, 500, 502, 503, 504] or attempt == 2:
-                    safe_diagnostic(stage, error, 'worker_api_failed', error.code)
+                    response_details = classify_http_error(error)
+                    safe_diagnostic(stage, error, 'worker_api_failed', error.code, response_details)
                     raise AppError('worker_api_failed', 'batch APIとの通信に失敗しました。', 502,
-                        {'http_status': error.code, 'cause_class': 'HTTPError'}) from None
+                        {'http_status': error.code, 'cause_class': 'HTTPError', **response_details}) from None
             except (urllib.error.URLError, ValueError) as error:
                 if attempt == 2:
                     safe_diagnostic(stage, error, 'worker_api_failed')
