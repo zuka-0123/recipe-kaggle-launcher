@@ -515,16 +515,25 @@ def extract_image(job, api, directory, root):
         {'path': path.relative_to(root).as_posix(), 'mime': 'image/jpeg', 'ref_id': 'src_001'}], 'warnings': []}
 
 
+def safe_job_diagnostic(stage, error):
+    stage = stage if stage in {'extract', 'structure', 'asr', 'frames', 'validate'} else 'extract'
+    kind = type(error).__name__
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', kind):
+        kind = 'Exception'
+    print('recipe_job_diag stage=' + stage + ' exception=' + kind, flush=True)
+
+
 def process_job(job, api, models, settings, root):
-    from workerlib.extractors.text import extract_text
-    from workerlib.extractors.web import extract_web
-    from workerlib.extractors.youtube import extract_youtube, download_audio, frames
-    from workerlib.extractors.common import evidence
     directory = root / ('job-' + valid_id(job['job_id']))
     directory.mkdir(exist_ok=True)
     value = job.get('input', {}).get('value', '')
     template = copy.deepcopy(job['template'])
+    stage = 'extract'
     try:
+        from workerlib.extractors.text import extract_text
+        from workerlib.extractors.web import extract_web
+        from workerlib.extractors.youtube import extract_youtube, download_audio, frames
+        from workerlib.extractors.common import evidence
         kind = job['input_type']
         if kind == 'text':
             extraction = extract_text(value, settings.max_input_chars)
@@ -543,44 +552,55 @@ def process_job(job, api, models, settings, root):
         first_structure_error = None
         requested = frame_seconds(job.get('input', {}).get('frame_seconds'), settings.max_video_seconds)
         if extraction['evidence'] and (kind != 'youtube' or any(e.get('text') for e in extraction['evidence'])):
+            stage = 'structure'
             try:
                 candidate, raw = models.structure(extraction, template)
             except AppError as error:
                 if kind != 'youtube' or error.code != 'llm_not_json' or not (job['input'].get('allow_asr', True) or requested):
                     raise
+                safe_job_diagnostic(stage, error)
                 # A malformed text candidate can still mean insufficient subtitles.
                 first_structure_error = error
                 raw = error.details.get('raw_output')
         if kind == 'youtube' and needs_more(candidate) and job['input'].get('allow_asr', True):
             # Use descriptions and original subtitles first; obtain audio only for gaps.
+            stage = 'asr'
             try:
                 audio = download_audio(extraction['video_url'], directory / 'audio', settings)
                 append_transcript(extraction, models.transcribe(audio), settings.max_input_chars)
+                stage = 'structure'
                 candidate, raw = models.structure(extraction, template)
             except AppError as error:
                 if first_structure_error and raw and 'raw_output' not in error.details:
                     error.details['raw_output'] = raw
                 if candidate is None and not requested:
                     raise
+                safe_job_diagnostic(stage, error)
                 extraction['warnings'].append('音声処理に失敗しました。取得済みの根拠を使います。')
         if kind == 'youtube' and needs_more(candidate) and requested:
+            stage = 'frames'
             extraction['images'] = frames(extraction['video_url'], requested, directory / 'frames', settings)
             for image in extraction['images']:
                 ref_id = f"src_{len(extraction['evidence'])+1:03d}"
                 image['ref_id'] = ref_id
                 extraction['evidence'].append(evidence(ref_id, 'youtube_overlay', start=image['second'], end=image['second']))
+            stage = 'structure'
             candidate, raw = models.structure(extraction, template)
         if candidate is None:
             if first_structure_error:
                 raise first_structure_error
             raise AppError('extraction_empty', 'レシピ情報を取得できません。本文入力やフレーム指定を利用してください。')
         # Validation errors stay editable in the draft; the cloud validates again on save.
+        stage = 'validate'
         from jsonschema import Draft202012Validator, FormatChecker
         errors = list(Draft202012Validator(models.schema, format_checker=FormatChecker()).iter_errors(candidate))
         result = {'job_id': job['job_id'], 'candidate': candidate,
             'evidence': extraction['evidence'], 'raw_output': raw}
         # Keep API payload within the common result contract; cloud reports validation errors.
         return result
+    except Exception as error:
+        safe_job_diagnostic(stage, error)
+        raise
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 

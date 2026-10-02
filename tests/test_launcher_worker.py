@@ -345,6 +345,35 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn('secret-source-and-token', json.dumps(result))
         self.assertTrue(result['error']['retryable'])
 
+    @unittest.skipUnless(importlib.util.find_spec('jsonschema') and importlib.util.find_spec('trafilatura') and importlib.util.find_spec('youtube_transcript_api'), 'Extractor test dependencies are unavailable')
+    def test_job_failure_stage_and_exception_class_only(self):
+        from workerlib.extractors import text, youtube
+        extraction = {'evidence': [{'ref_id': 'src_001', 'type': 'youtube_description', 'text': '一部だけ', 'start_seconds': None, 'end_seconds': None}],
+            'images': [], 'warnings': [], 'video_url': 'https://www.youtube.com/watch?v=abcdefghijk'}
+        incomplete = {'title': {'original': '料理'}, 'ingredients': [], 'steps': []}
+        for stage in ['extract', 'structure', 'asr', 'frames']:
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temporary:
+                private_error = RuntimeError('private-source-token https://private.example')
+                models = types.SimpleNamespace(schema={}, structure=lambda *_: (incomplete, '{}'),
+                    transcribe=lambda *_: (_ for _ in ()).throw(private_error))
+                kind = 'text' if stage in ['extract', 'structure'] else 'youtube'
+                job = {'job_id': 'job-1', 'input_type': kind, 'input': {'value': '原典',
+                    'allow_asr': stage == 'asr', 'frame_seconds': [1] if stage == 'frames' else []}, 'template': {'source': {}}}
+                if stage == 'structure':
+                    models.structure = lambda *_: (_ for _ in ()).throw(private_error)
+                output = io.StringIO()
+                with patch.object(text, 'extract_text', side_effect=private_error if stage == 'extract' else None, return_value=extraction), patch.object(youtube, 'extract_youtube', return_value=extraction), patch.object(youtube, 'download_audio', return_value=Path('unused.mp3')), patch.object(youtube, 'frames', side_effect=private_error), redirect_stdout(output):
+                    with self.assertRaises(RuntimeError):
+                        worker.process_job(job, None, models, worker.settings_from({}, Path(temporary)), Path(temporary))
+                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage={stage} exception=RuntimeError')
+
+    def test_job_diagnostic_keeps_cuda_exception_class_without_message(self):
+        OutOfMemoryError = type('OutOfMemoryError', (RuntimeError,), {})
+        output = io.StringIO()
+        with redirect_stdout(output):
+            worker.safe_job_diagnostic('structure', OutOfMemoryError('secret tensor/source details'))
+        self.assertEqual(output.getvalue().strip(), 'recipe_job_diag stage=structure exception=OutOfMemoryError')
+
     def test_quota_failure_posts_all_results_and_finishes(self):
         records = []
         class FakeAPI:
