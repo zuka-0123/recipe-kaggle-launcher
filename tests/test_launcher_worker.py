@@ -185,6 +185,36 @@ class WorkerTests(unittest.TestCase):
         self.assertIn('stage=failure_report code=report_failed exception=URLError reason_class=SSLCertVerificationError', output.getvalue())
         self.assertNotIn('private-source-token', output.getvalue())
 
+    def test_api_has_dedicated_user_agent_and_accept_headers(self):
+        captured = []
+        def open_request(request, **kwargs):
+            captured.append(request)
+            return io.BytesIO(b'{"ok":true}')
+        opener = types.SimpleNamespace(open=open_request)
+        with patch.object(worker.urllib.request, 'build_opener', return_value=opener):
+            worker.BatchAPI(claim()).request()
+            worker.BatchAPI(claim()).request('/inputs/job-1', binary=True)
+        self.assertTrue(all(request.get_header('User-agent') == 'PersonalRecipeKB-worker/1.0' for request in captured))
+        self.assertEqual(captured[0].get_header('Accept'), 'application/json')
+        self.assertEqual(captured[1].get_header('Accept'), 'application/octet-stream')
+
+    def test_http_body_classification_emits_only_fixed_labels(self):
+        cases = [({'cf-mitigated': 'challenge'}, b'private-token', 'edge_challenge', None),
+            ({'content-type': 'application/json'}, b'{"error":{"code":"unauthorized","message":"private-token"}}', 'application_json', 'unauthorized'),
+            ({'content-type': 'application/json'}, b'{"error":{"code":"private-token"}}', 'application_json', None),
+            ({'content-type': 'text/html'}, b'<title>Just a moment</title>cloudflare private-token', 'edge_challenge', None),
+            ({'content-type': 'text/html'}, b'Cloudflare Ray ID private-token', 'cloudflare_html', None)]
+        for headers, body, kind, application_code in cases:
+            with self.subTest(kind=kind, application_code=application_code):
+                error = worker.urllib.error.HTTPError('https://private.example/token', 403, 'private-token', headers, io.BytesIO(body))
+                details = worker.classify_http_error(error)
+                self.assertEqual(details.get('response_kind'), kind)
+                self.assertEqual(details.get('application_error_code'), application_code)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    worker.safe_diagnostic('api_get', error, 'worker_api_failed', 403, details)
+                self.assertNotIn('private', output.getvalue())
+
     def test_strict_json_and_markdown_json(self):
         self.assertEqual(worker.parse_json('```json\n{"title":null}\n```'), {'title': None})
         for raw in ['[1]', '{"quantity":NaN}', 'Here is your recipe: {}']:

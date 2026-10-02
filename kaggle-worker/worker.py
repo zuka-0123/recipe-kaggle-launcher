@@ -191,7 +191,9 @@ class BatchAPI:
         if time.time() >= self.expires:
             raise AppError('worker_token_expired', 'batch tokenの期限が切れています。')
         request = urllib.request.Request(self.url + suffix,
-            headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'},
+            headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json',
+                'User-Agent': 'PersonalRecipeKB-worker/1.0',
+                'Accept': 'application/octet-stream' if binary else 'application/json'},
             data=None if payload is None else json.dumps(payload, ensure_ascii=False, allow_nan=False).encode())
         maximum = MAX_IMAGE_BYTES if binary else MAX_BATCH_JSON_BYTES
         for attempt in range(3):
