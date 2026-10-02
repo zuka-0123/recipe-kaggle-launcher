@@ -515,12 +515,31 @@ def extract_image(job, api, directory, root):
         {'path': path.relative_to(root).as_posix(), 'mime': 'image/jpeg', 'ref_id': 'src_001'}], 'warnings': []}
 
 
+def job_failure_reason(error):
+    """Inspect error text locally and return one fixed label; never return text."""
+    try:
+        message = str(error).lower()[:8192]
+    except Exception:
+        message = ''
+    if type(error).__name__ == 'OutOfMemoryError' or ('cuda' in message and 'out of memory' in message) or any(
+            label in message for label in ['cudnn_status_alloc_failed', 'cublas_status_alloc_failed']):
+        return 'gpu_memory'
+    if any(label in message for label in ['libcudnn', 'libcublas', 'cudnn library',
+            'could not load cudnn', 'could not load cuda', 'cuda driver version is insufficient']):
+        return 'cuda_library'
+    if any(label in message for label in ['couldn\'t connect to \'https://huggingface.co',
+            'cannot find the requested files in the disk cache', 'gated repo',
+            'failed to download model', 'model download failed']):
+        return 'model_download'
+    return 'runtime_other'
+
+
 def safe_job_diagnostic(stage, error):
     stage = stage if stage in {'extract', 'structure', 'asr', 'frames', 'validate'} else 'extract'
     kind = type(error).__name__
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', kind):
         kind = 'Exception'
-    print('recipe_job_diag stage=' + stage + ' exception=' + kind, flush=True)
+    print('recipe_job_diag stage=' + stage + ' exception=' + kind + ' reason=' + job_failure_reason(error), flush=True)
 
 
 def process_job(job, api, models, settings, root):

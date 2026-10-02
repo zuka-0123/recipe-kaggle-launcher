@@ -365,14 +365,30 @@ class WorkerTests(unittest.TestCase):
                 with patch.object(text, 'extract_text', side_effect=private_error if stage == 'extract' else None, return_value=extraction), patch.object(youtube, 'extract_youtube', return_value=extraction), patch.object(youtube, 'download_audio', return_value=Path('unused.mp3')), patch.object(youtube, 'frames', side_effect=private_error), redirect_stdout(output):
                     with self.assertRaises(RuntimeError):
                         worker.process_job(job, None, models, worker.settings_from({}, Path(temporary)), Path(temporary))
-                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage={stage} exception=RuntimeError')
+                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage={stage} exception=RuntimeError reason=runtime_other')
 
     def test_job_diagnostic_keeps_cuda_exception_class_without_message(self):
         OutOfMemoryError = type('OutOfMemoryError', (RuntimeError,), {})
         output = io.StringIO()
         with redirect_stdout(output):
             worker.safe_job_diagnostic('structure', OutOfMemoryError('secret tensor/source details'))
-        self.assertEqual(output.getvalue().strip(), 'recipe_job_diag stage=structure exception=OutOfMemoryError')
+        self.assertEqual(output.getvalue().strip(), 'recipe_job_diag stage=structure exception=OutOfMemoryError reason=gpu_memory')
+
+    def test_job_reason_labels_never_expose_error_text(self):
+        cases = [('CUDA out of memory: private-token https://private.example', 'gpu_memory'),
+            ('CUDA failed with error out of memory private-token', 'gpu_memory'),
+            ('Library libcudnn_ops.so.9 not found private-token', 'cuda_library'),
+            ('Could not load libcublas.so private-token', 'cuda_library'),
+            ("Couldn't connect to 'https://huggingface.co' private-token", 'model_download'),
+            ('private-token https://private.example arbitrary failure', 'runtime_other')]
+        for message, reason in cases:
+            with self.subTest(reason=reason):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    worker.safe_job_diagnostic('asr', RuntimeError(message))
+                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage=asr exception=RuntimeError reason={reason}')
+                self.assertNotIn('private-token', output.getvalue())
+                self.assertNotIn('https://', output.getvalue())
 
     def test_quota_failure_posts_all_results_and_finishes(self):
         records = []
