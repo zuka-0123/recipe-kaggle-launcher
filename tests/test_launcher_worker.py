@@ -134,6 +134,54 @@ class LauncherTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists(), 'Main workspace Canonical Schema is required for this contract test')
+    def test_compact_prompt_keeps_complete_array_shapes_and_enums(self):
+        schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
+        template = {'source': {'type': 'text'}, 'ingredients': [], 'steps': []}
+        text = '料理（2人分）\n材料\n鶏肉1/2枚\nしょうゆ大さじ1\nみりん大さじ1/2\n砂糖小さじ1\n塩少々\n油適量\n作り方\n1.切る。\n2.中火で片面3分ずつ焼く。\n3.1分煮詰める。'
+        extraction = {'evidence': [{'ref_id': 'src_001', 'type': 'manual_input', 'text': text}]}
+        system, prompt = worker.build_structure_prompts('原典以外を推測しない。', schema, template, extraction)
+        full, _ = worker.build_structure_prompts('原典以外を推測しない。', schema, template, extraction, 'full')
+        payload = json.loads(prompt.split('\n')[0])
+        self.assertEqual(payload['evidence'][0]['text'], text)
+        self.assertEqual(template['ingredients'], [])
+        self.assertEqual(payload['item_shapes']['steps']['duration'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(payload['item_shapes']['steps']['temperature'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertIsNone(payload['item_shapes']['steps']['heat'])
+        self.assertEqual(payload['item_shapes']['ingredients']['amount'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(payload['item_shapes']['source_refs']['type'], 'manual_input')
+        self.assertEqual(payload['item_shapes']['source_refs']['ref_id'], 'src_001')
+        self.assertIn('すべてingredients', system)
+        self.assertIn('前の工程の火加減を引き継がず', system)
+        self.assertIn('raw_text="2人分"', system)
+        self.assertIn('"ingredients[].amount.unit"', system)
+        self.assertIn('value・unit・raw_textの3キー', system)
+        self.assertIn('大さじはtbsp', system)
+        self.assertIn('amount.value=null、amount.unit=null', system)
+        self.assertIn('pinch等のenumにない単位', system)
+        self.assertLess(len(system), len(full))
+        self.assertIn('JSON Schema:', full)
+
+    def test_absence_repairs_preserve_original_raw_output_and_values(self):
+        raw = json.dumps({'title': {'original': '原典', 'normalized': ''},
+            'ingredients': [{'name': {'raw': '塩', 'normalized': ''}, 'amount': {'value': 1, 'unit': 'pinch', 'raw_text': 'ひとつまみ'}}],
+            'steps': [{'step': 1, 'duration': None, 'temperature': None, 'heat': 'medium'},
+                {'step': 2, 'duration': {'value': 3, 'unit': 'minute', 'raw_text': '片面3分ずつ'}, 'temperature': 'unknown'},
+                {'step': 3, 'duration': [], 'temperature': 0}]}, ensure_ascii=False)
+        candidate = worker.parse_json(raw)
+        repaired = worker.repair_literal_absence(candidate)
+        self.assertEqual(repaired['steps'][0]['duration'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(repaired['steps'][0]['temperature'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(repaired['steps'][0]['heat'], 'medium')
+        self.assertEqual(repaired['steps'][1]['duration']['value'], 3)
+        self.assertEqual(repaired['steps'][1]['temperature'], 'unknown')
+        self.assertEqual(repaired['steps'][2]['duration'], [])
+        self.assertEqual(repaired['steps'][2]['temperature'], 0)
+        self.assertEqual(repaired['ingredients'][0]['amount']['unit'], 'pinch')
+        self.assertIsNone(repaired['title']['normalized'])
+        self.assertIsNone(repaired['ingredients'][0]['name']['normalized'])
+        self.assertIsNone(json.loads(raw)['steps'][0]['duration'])
+
     def test_bootstrap_and_failure_report_import_without_site_packages(self):
         script = 'import sys; sys.path.insert(0, ' + repr(str(ROOT / 'kaggle-worker')) + '); from worker import bootstrap, fail_batch, BatchAPI; print("stdlib-bootstrap-import-ok")'
         result = worker.subprocess.run([sys.executable, '-S', '-c', script], capture_output=True, text=True, timeout=10)

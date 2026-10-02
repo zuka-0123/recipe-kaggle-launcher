@@ -248,6 +248,114 @@ def model_name(value, default):
     return value
 
 
+COMPLETENESS_RULES = '''原典で読める材料をすべてingredientsへ、調理工程をすべてstepsへ記録してください。先頭の材料だけや代表的な工程だけに省略しないでください。
+材料欄と手順欄を最初から最後まで読み、材料は1項目につき1件、工程は原典の順番に並べてください。読めない項目は推測しません。
+templateやitem_shapesはJSONの形を示すものです。配列の空・1件という例に合わせず、原典に存在する件数を出力してください。
+各stepのdurationとtemperatureは必ず{"value":null,"unit":null,"raw_text":null}形式のobjectを保持します。不明だからといってobject全体をnullにしないでください。
+材料amountもobjectを保持し、value・unit・raw_textの3キーを必ず含めます。raw_textは読めた分量表現を数量・単位・語順ごと原文通り保存します。ほかの欄から原文を作り直しません。
+unitは提示したCanonical enumの値だけです。日本語の「大さじ」「小さじ」「個」「本」「少々」をunitへそのまま入れないでください。大さじはtbsp、小さじはtsp、個・本の個数はpieceへ表記統一できます。対応が判断できない単位はunit=null、raw_textに原文を残します。
+「少々」「適量」「ひとつまみ」「お好みで」等はamount.value=null、amount.unit=null、amount.raw_textに読めた原文を残してください。pinch等のenumにない単位や、推測した数値を返さないでください。
+heatは各工程の原文に火加減が明記される場合だけ設定します。未記載の工程はheat=nullです。前の工程の火加減を引き継がず、煮詰める等の動詞から推測しません。
+料理名や見出しの「2人分」等も原典の人数情報です。title.originalの原文を保持し、yield.quantity=2、unit="serving"、raw_text="2人分"のようにyieldにも記録してください。記載がなければyieldの各値はnullです。
+時間・温度もその工程で明記された値だけを記録します。「片面3分ずつ」を合計6分へ計算するなど、原典にない値を作らないでください。
+出力前に原典の材料欄と工程欄をもう一度照合し、材料の抜け、工程の抜け、object全体のnull、他工程から移したheatがないことを確認してください。
+出力はCanonical Recipe JSONオブジェクト1個だけです。確認作業の説明や別形式の中間データは出力しません。'''
+
+
+def resolve_schema(node, schema):
+    if '$ref' not in node:
+        return node
+    value = schema
+    reference = node['$ref']
+    if not reference.startswith('#/'):
+        raise AppError('invalid_schema', 'Canonical Schemaの参照形式が不正です。')
+    for part in reference[2:].split('/'):
+        value = value[part.replace('~1', '/').replace('~0', '~')]
+    return value
+
+
+def schema_shape(node, schema):
+    """Show Canonical item fields, without inventing any ingredient/step content."""
+    node = resolve_schema(node, schema)
+    if 'properties' in node:
+        return {key: schema_shape(child, schema) for key, child in node['properties'].items()}
+    types = node.get('type', [])
+    types = [types] if isinstance(types, str) else types
+    if 'null' in types:
+        return None
+    if 'array' in types:
+        return []
+    if 'boolean' in types:
+        return False
+    if 'integer' in types or 'number' in types:
+        return 1
+    if 'const' in node:
+        return node['const']
+    if 'enum' in node:
+        return node['enum'][0]
+    return '' if 'string' in types else None
+
+
+def schema_enums(schema):
+    values = {}
+    def visit(node, path, seen=()):
+        reference = node.get('$ref')
+        if reference in seen:
+            return
+        node = resolve_schema(node, schema)
+        if 'enum' in node:
+            values[path] = node['enum']
+        if 'const' in node:
+            values[path] = [node['const']]
+        for key, child in node.get('properties', {}).items():
+            visit(child, path + '.' + key if path else key, seen + ((reference,) if reference else ()))
+        if isinstance(node.get('items'), dict):
+            visit(node['items'], path + '[]', seen + ((reference,) if reference else ()))
+    visit(schema, '')
+    return values
+
+
+def build_structure_prompts(rules, schema, template, extraction, schema_mode='compact'):
+    if schema_mode not in ['compact', 'full']:
+        raise AppError('invalid_prompt_mode', 'prompt Schema modeはcompactまたはfullを指定してください。')
+    system = rules + '\n\n' + COMPLETENESS_RULES
+    if schema_mode == 'full':
+        system += '\nJSON Schema:\n' + json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
+    else:
+        system += '\nCanonicalのenum許可値:\n' + json.dumps(schema_enums(schema), ensure_ascii=False, separators=(',', ':'))
+    # These are shapes of the existing Canonical arrays, not a new output format.
+    shapes = {key: schema_shape(schema['properties'][key]['items'], schema)
+        for key in ['ingredients', 'steps', 'source_refs']}
+    if extraction['evidence']:
+        shapes['source_refs']['ref_id'] = extraction['evidence'][0]['ref_id']
+        shapes['source_refs']['type'] = extraction['evidence'][0]['type']
+    payload = {'source': template['source'], 'template': template,
+        'item_shapes': shapes, 'evidence': extraction['evidence']}
+    prompt = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    prompt += '\n原典の材料と工程を最後まで照合してください。すべての材料・工程をCanonicalへ含め、各工程のduration/temperatureはobject、未記載heatはnull、人数は見出しも確認します。'
+    return system, prompt
+
+
+def repair_literal_absence(candidate):
+    """Restore required containers for literal null; never convert evidence values."""
+    if not isinstance(candidate, dict):
+        return candidate
+    steps = candidate.get('steps')
+    for step in steps if isinstance(steps, list) else []:
+        if isinstance(step, dict):
+            for key in ['duration', 'temperature']:
+                if key in step and step[key] is None:
+                    step[key] = {'value': None, 'unit': None, 'raw_text': None}
+    names = [candidate.get('title')]
+    ingredients = candidate.get('ingredients')
+    if isinstance(ingredients, list):
+        names.extend(item.get('name') for item in ingredients if isinstance(item, dict))
+    for name in names:
+        if isinstance(name, dict) and name.get('normalized') == '':
+            name['normalized'] = None
+    return candidate
+
+
 class Models:
     """Only one LLM, VLM or ASR is resident at a time; retain across equal jobs."""
     def __init__(self, config, schema, rules, root, deadline):
@@ -290,9 +398,8 @@ class Models:
         import torch
         images = extraction.get('images', [])
         self.load('vlm' if images else 'llm')
-        system = self.rules + '\nJSON Schema:\n' + json.dumps(self.schema, ensure_ascii=False, separators=(',', ':'))
-        prompt = json.dumps({'source': template['source'], 'template': template,
-            'evidence': extraction['evidence']}, ensure_ascii=False, separators=(',', ':'))
+        system, prompt = build_structure_prompts(self.rules, self.schema, template, extraction,
+            self.config.get('prompt_schema_mode', 'compact'))
         if images:
             from qwen_vl_utils import process_vision_info
             content = [{'type': 'text', 'text': prompt}]
@@ -328,6 +435,7 @@ class Models:
         for key in ['recipe_id', 'schema_version', 'created_at', 'updated_at', 'source']:
             candidate[key] = copy.deepcopy(template[key])
         candidate['user_corrections'] = []
+        repair_literal_absence(candidate)
         enforce_evidence(candidate, extraction['evidence'])
         return candidate, raw[:MAX_OUTPUT_CHARS]
 
