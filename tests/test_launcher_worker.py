@@ -1,5 +1,6 @@
 """CPU-only contract tests. Models, network and Kaggle submission are mocked."""
 import datetime as dt
+import enum
 import importlib.util
 import io
 import json
@@ -31,7 +32,7 @@ class LauncherTests(unittest.TestCase):
 
     def test_running_and_queued_notebooks_block_launch(self):
         for status in ['running', 'queued', 'mystery']:
-            with self.subTest(status=status), patch.object(launcher.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=f'owner/worker has status "{status}"')) as call:
+            with self.subTest(status=status), patch.object(launcher.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=f'owner/recipe-worker has status "{status}"')) as call:
                 with self.assertRaises(launcher.LaunchError):
                     launcher.launch(claim(), 'owner', 'recipe-worker')
                 self.assertEqual(call.call_count, 1)
@@ -40,7 +41,7 @@ class LauncherTests(unittest.TestCase):
         inspected = []
         def cli(command, **kwargs):
             if 'status' in command:
-                return types.SimpleNamespace(returncode=0, stdout='owner/worker has status "complete"')
+                return types.SimpleNamespace(returncode=0, stdout='owner/recipe-worker has status "complete"')
             self.assertIn('NvidiaTeslaT4', command)
             self.assertIn('--timeout', command)
             temporary = Path(command[command.index('-p') + 1])
@@ -96,6 +97,33 @@ class LauncherTests(unittest.TestCase):
                 with self.assertRaises(launcher.LaunchError) as captured:
                     launcher.kernel_status('owner/recipe-worker')
                 self.assertEqual(captured.exception.code, code)
+
+    def test_v222_sdk_enum_status_output(self):
+        # Definitions match Kaggle's official kagglesdk kernels_enums.py.
+        class KernelWorkerStatus(enum.Enum):
+            QUEUED = 0
+            RUNNING = 1
+            COMPLETE = 2
+            ERROR = 3
+            CANCEL_REQUESTED = 4
+            CANCEL_ACKNOWLEDGED = 5
+            NEW_SCRIPT = 6
+        for status in KernelWorkerStatus:
+            stdout = 'owner/recipe-worker has status "%s"\n' % status
+            with self.subTest(status=status.name), patch.object(launcher.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=stdout)):
+                if status.name in ['COMPLETE', 'ERROR', 'CANCEL_ACKNOWLEDGED']:
+                    self.assertEqual(launcher.kernel_status('owner/recipe-worker'), status.name.lower())
+                else:
+                    with self.assertRaisesRegex(launcher.LaunchError, 'kaggle_busy'):
+                        launcher.kernel_status('owner/recipe-worker')
+
+    def test_unknown_enum_and_failure_message_cannot_override_status(self):
+        for stdout in ['owner/recipe-worker has status "KernelWorkerStatus.UNKNOWN"\n',
+                'owner/recipe-worker has status "KernelWorkerStatus.RUNNING"\nFailure message: "has status complete"\n',
+                'another/private-kernel has status "KernelWorkerStatus.COMPLETE"\n',
+                'owner/recipe-worker has status "AnotherEnum.COMPLETE"\n']:
+            with self.subTest(stdout=stdout), patch.object(launcher.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=stdout)), self.assertRaises(launcher.LaunchError):
+                launcher.kernel_status('owner/recipe-worker')
 
     def test_urls_do_not_redirect_credentials(self):
         self.assertIsNone(launcher.NoRedirect().redirect_request(None, None, None, None, None, None))

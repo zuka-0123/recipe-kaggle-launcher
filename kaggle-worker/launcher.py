@@ -14,7 +14,8 @@ from urllib.parse import urlsplit
 import zipfile
 
 HERE = Path(__file__).resolve().parent
-ACTIVE_STATUSES = {'running', 'queued', 'starting', 'pending', 'initializing'}
+ACTIVE_STATUSES = {'running', 'queued', 'starting', 'pending', 'initializing', 'cancel_requested', 'new_script'}
+TERMINAL_STATUSES = {'complete', 'completed', 'error', 'failed', 'cancelled', 'canceled', 'cancel_acknowledged'}
 
 
 class LaunchError(Exception):
@@ -89,11 +90,15 @@ def kernel_status(reference):
         if re.search(r'\b404\b[^\n]{0,60}\bnot\s*found\b', diagnostic, re.I):
             return 'missing'
         raise LaunchError(status_failure_code(diagnostic))
-    match = re.search(r'(?:status\s*[:=]\s*|status\s+)["\']?([a-z_]+)', result.stdout, re.I)
+    # v2.2.2 prints the SDK enum with %s: "KernelWorkerStatus.COMPLETE".
+    # Match the complete quoted value on this kernel's line, not a failure message.
+    match = re.search(r'^' + re.escape(reference) +
+        r'\s+has status\s+"(?:KernelWorkerStatus\.)?([A-Za-z_]+)"\s*$',
+        result.stdout, re.M)
     status = match.group(1).lower() if match else ''
     if status in ACTIVE_STATUSES:
         raise LaunchError('kaggle_busy')
-    if status not in {'complete', 'completed', 'error', 'failed', 'cancelled', 'canceled'}:
+    if status not in TERMINAL_STATUSES:
         raise LaunchError('kaggle_status_unknown')
     return status
 
