@@ -1,5 +1,6 @@
 """CPU-only contract tests. Models, network and Kaggle submission are mocked."""
 import datetime as dt
+from contextlib import redirect_stdout
 import enum
 import importlib.util
 import io
@@ -133,6 +134,57 @@ class LauncherTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_bootstrap_and_failure_report_import_without_site_packages(self):
+        script = 'import sys; sys.path.insert(0, ' + repr(str(ROOT / 'kaggle-worker')) + '); from worker import bootstrap, fail_batch, BatchAPI; print("stdlib-bootstrap-import-ok")'
+        result = worker.subprocess.run([sys.executable, '-S', '-c', script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), 'stdlib-bootstrap-import-ok')
+
+    def test_pip_failure_reports_batch_with_safe_stage_diagnostic(self):
+        output = io.StringIO()
+        result = types.SimpleNamespace(returncode=1, stderr='No matching distribution found for secret-token at https://private.example')
+        with patch.object(worker.subprocess, 'run', return_value=result), patch.object(worker, 'fail_batch') as report, patch.object(worker, 'run') as run, redirect_stdout(output):
+            worker.bootstrap(claim(), Path('.'))
+        report.assert_called_once()
+        run.assert_not_called()
+        self.assertIn('stage=dependency_install code=pip_no_matching_distribution exception=RuntimeError', output.getvalue())
+        self.assertNotIn('secret-token', output.getvalue())
+        self.assertNotIn('private.example', output.getvalue())
+
+    def test_worker_api_error_and_failure_report_keep_only_http_status(self):
+        error = AppError('worker_api_failed', 'secret-body', details={'http_status': 403, 'cause_class': 'HTTPError'})
+        output = io.StringIO()
+        with patch.object(worker.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)), patch.object(worker, 'run', side_effect=error), patch.object(worker, 'fail_batch', side_effect=error), redirect_stdout(output):
+            worker.bootstrap(claim(), Path('.'))
+        text = output.getvalue()
+        self.assertIn('stage=worker_run code=worker_api_failed exception=HTTPError http_status=403', text)
+        self.assertIn('stage=failure_report code=report_failed exception=HTTPError http_status=403', text)
+        self.assertNotIn('secret-body', text)
+
+    def test_api_http_error_has_safe_stage_and_preserved_numeric_status(self):
+        output = io.StringIO()
+        opener = types.SimpleNamespace(open=lambda *a, **k: (_ for _ in ()).throw(worker.urllib.error.HTTPError('https://private.example/secret', 401, 'private-secret-body', {}, None)))
+        with patch.object(worker.urllib.request, 'build_opener', return_value=opener), redirect_stdout(output):
+            with self.assertRaises(AppError) as caught:
+                worker.BatchAPI(claim()).request('/start', {})
+        self.assertEqual(caught.exception.details['http_status'], 401)
+        self.assertIn('stage=api_start code=worker_api_failed exception=HTTPError http_status=401', output.getvalue())
+        self.assertNotIn('private', output.getvalue())
+
+    def test_api_network_error_keeps_safe_reason_class(self):
+        import ssl
+        output = io.StringIO()
+        error = worker.urllib.error.URLError(ssl.SSLCertVerificationError('private-source-token'))
+        opener = types.SimpleNamespace(open=lambda *a, **k: (_ for _ in ()).throw(error))
+        with patch.object(worker.urllib.request, 'build_opener', return_value=opener), patch.object(worker.time, 'sleep'), redirect_stdout(output):
+            with self.assertRaises(AppError) as caught:
+                worker.BatchAPI(claim()).request()
+            worker.safe_diagnostic('failure_report', caught.exception, 'report_failed')
+        self.assertEqual(caught.exception.details['reason_class'], 'SSLCertVerificationError')
+        self.assertIn('stage=api_get code=worker_api_failed exception=URLError reason_class=SSLCertVerificationError', output.getvalue())
+        self.assertIn('stage=failure_report code=report_failed exception=URLError reason_class=SSLCertVerificationError', output.getvalue())
+        self.assertNotIn('private-source-token', output.getvalue())
+
     def test_strict_json_and_markdown_json(self):
         self.assertEqual(worker.parse_json('```json\n{"title":null}\n```'), {'title': None})
         for raw in ['[1]', '{"quantity":NaN}', 'Here is your recipe: {}']:

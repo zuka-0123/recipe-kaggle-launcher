@@ -126,21 +126,26 @@ def notebook(claim):
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 root = pathlib.Path(tempfile.mkdtemp(prefix='recipe-batch-', dir='/tmp'))
+stage = 'unpack'
 try:
     zipfile.ZipFile(io.BytesIO(base64.b64decode(BUNDLE))).extractall(root)
     sys.path.insert(0, str(root))
-    install = subprocess.run([sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '-q', '-r', str(root / 'requirements-worker.txt')], capture_output=True, timeout=600)
-    if install.returncode:
-        raise RuntimeError('dependency_install_failed')
-    from worker import run
-    run(CONFIG, root)
-except BaseException:
+    stage = 'worker_import'
+    from worker import bootstrap
+    bootstrap(CONFIG, root)
+except BaseException as error:
+    kind = type(error).__name__
+    if kind not in {'RuntimeError', 'ImportError', 'ModuleNotFoundError', 'SyntaxError', 'OSError', 'ValueError', 'KeyboardInterrupt'}:
+        kind = 'Exception'
+    print('recipe_diag stage=' + stage + ' code=bootstrap_failed exception=' + kind)
     try:
         from worker import fail_batch
         fail_batch(CONFIG, 'notebook_failed')
-    except BaseException:
-        pass
-    print('Recipe batch stopped. Check the Web UI job status; no input or credentials are logged.')
+    except BaseException as report_error:
+        kind = type(report_error).__name__
+        if kind not in {'RuntimeError', 'ImportError', 'ModuleNotFoundError', 'OSError', 'ValueError', 'AppError'}:
+            kind = 'Exception'
+        print('recipe_diag stage=failure_report code=report_failed exception=' + kind)
 finally:
     shutil.rmtree(root, ignore_errors=True)
 '''

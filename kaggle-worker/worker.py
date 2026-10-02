@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import subprocess
+import sys
 import time
 from types import SimpleNamespace
 import urllib.error
@@ -30,6 +32,84 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class BatchTimeout(Exception):
     pass
+
+
+SAFE_EXCEPTION_CLASSES = {'Exception', 'RuntimeError', 'ImportError', 'ModuleNotFoundError',
+    'OSError', 'ValueError', 'JSONDecodeError', 'TypeError', 'KeyError', 'TimeoutError',
+    'TimeoutExpired', 'HTTPError', 'URLError', 'AppError', 'BatchTimeout', 'KeyboardInterrupt'}
+SAFE_DIAGNOSTIC_CODES = {'bootstrap_failed', 'worker_failed', 'report_failed', 'worker_api_failed',
+    'worker_token_expired', 'invalid_worker_url', 'invalid_batch', 'missing_prompt',
+    'pip_install_failed', 'pip_no_matching_distribution', 'pip_resolution_failed',
+    'pip_network_failed', 'pip_build_failed', 'pip_install_timeout', 'pip_oserror'}
+SAFE_STAGES = {'dependency_install', 'worker_run', 'failure_report',
+    'api_get', 'api_start', 'api_results', 'api_finish', 'api_input', 'api_request'}
+SAFE_NETWORK_REASON_CLASSES = {'gaierror', 'SSLCertVerificationError', 'SSLError',
+    'ConnectionRefusedError', 'ConnectionResetError', 'ConnectionAbortedError',
+    'TimeoutError', 'OSError', 'str'}
+
+
+def network_reason_class(error):
+    value = type(error.reason).__name__ if isinstance(error, urllib.error.URLError) else None
+    return value if value in SAFE_NETWORK_REASON_CLASSES else None
+
+
+def safe_diagnostic(stage, error, code=None, http_status=None):
+    """Only fixed labels, exception class and numeric HTTP status reach stdout."""
+    stage = stage if stage in SAFE_STAGES else 'worker_run'
+    details = error.details if isinstance(error, AppError) else {}
+    kind = details.get('cause_class', type(error).__name__)
+    kind = kind if kind in SAFE_EXCEPTION_CLASSES else 'Exception'
+    code = code or (error.code if isinstance(error, AppError) else 'worker_failed')
+    code = code if code in SAFE_DIAGNOSTIC_CODES else 'worker_failed'
+    status = http_status if http_status is not None else details.get('http_status')
+    line = 'recipe_diag stage=' + stage + ' code=' + code + ' exception=' + kind
+    if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+        line += ' http_status=' + str(status)
+    reason = details.get('reason_class') or network_reason_class(error)
+    if reason in SAFE_NETWORK_REASON_CLASSES:
+        line += ' reason_class=' + reason
+    print(line, flush=True)
+
+
+def pip_failure_code(stderr):
+    # Inspect captured text locally; neither package names nor raw output are logged.
+    if 'No matching distribution found' in stderr or 'Could not find a version' in stderr:
+        return 'pip_no_matching_distribution'
+    if 'ResolutionImpossible' in stderr or 'conflicting dependencies' in stderr:
+        return 'pip_resolution_failed'
+    if any(label in stderr for label in ['NewConnectionError', 'Temporary failure in name resolution', 'ConnectionError']):
+        return 'pip_network_failed'
+    if 'Failed building wheel' in stderr or 'subprocess-exited-with-error' in stderr:
+        return 'pip_build_failed'
+    return 'pip_install_failed'
+
+
+def bootstrap(config, root):
+    """Imports before pip need only stdlib and bundled workerlib.errors."""
+    stage = 'dependency_install'
+    code = 'pip_install_failed'
+    try:
+        try:
+            install = subprocess.run([sys.executable, '-m', 'pip', 'install',
+                '--disable-pip-version-check', '-q', '-r', str(root / 'requirements-worker.txt')],
+                capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            code = 'pip_install_timeout'
+            raise
+        except OSError:
+            code = 'pip_oserror'
+            raise
+        if install.returncode:
+            code = pip_failure_code(install.stderr or '')
+            raise RuntimeError('dependency_install_failed')
+        stage, code = 'worker_run', None
+        run(config, root)
+    except BaseException as error:
+        safe_diagnostic(stage, error, code)
+        try:
+            fail_batch(config, 'notebook_failed')
+        except BaseException as report_error:
+            safe_diagnostic('failure_report', report_error, 'report_failed')
 
 
 def parse_json(raw):
@@ -65,6 +145,8 @@ class BatchAPI:
             raise AppError('worker_token_expired', 'batch tokenの期限が切れています。')
 
     def request(self, suffix='', payload=None, binary=False):
+        stage = {'': 'api_get', '/start': 'api_start', '/results': 'api_results',
+            '/finish': 'api_finish'}.get(suffix, 'api_input' if suffix.startswith('/inputs/') else 'api_request')
         if time.time() >= self.expires:
             raise AppError('worker_token_expired', 'batch tokenの期限が切れています。')
         request = urllib.request.Request(self.url + suffix,
@@ -80,10 +162,15 @@ class BatchAPI:
                     return body if binary else json.loads(body)
             except urllib.error.HTTPError as error:
                 if error.code not in [429, 500, 502, 503, 504] or attempt == 2:
-                    raise AppError('worker_api_failed', 'batch APIとの通信に失敗しました。', 502) from None
-            except (urllib.error.URLError, ValueError):
+                    safe_diagnostic(stage, error, 'worker_api_failed', error.code)
+                    raise AppError('worker_api_failed', 'batch APIとの通信に失敗しました。', 502,
+                        {'http_status': error.code, 'cause_class': 'HTTPError'}) from None
+            except (urllib.error.URLError, ValueError) as error:
                 if attempt == 2:
-                    raise AppError('worker_api_failed', 'batch APIとの通信に失敗しました。', 502) from None
+                    safe_diagnostic(stage, error, 'worker_api_failed')
+                    raise AppError('worker_api_failed', 'batch APIとの通信に失敗しました。', 502,
+                        {'cause_class': type(error).__name__ if type(error).__name__ in SAFE_EXCEPTION_CLASSES else 'Exception',
+                         'reason_class': network_reason_class(error)}) from None
             time.sleep(2 ** attempt)
         raise AppError('worker_api_failed', 'batch APIとの通信に失敗しました。', 502)
 
