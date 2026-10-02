@@ -1,0 +1,34 @@
+name: Launch private Kaggle recipe batch
+on:
+  repository_dispatch:
+    types: [recipe_batch]
+permissions:
+  contents: read
+concurrency:
+  group: recipe-kaggle-launcher
+  cancel-in-progress: false
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install launcher only
+        run: python -m pip install --disable-pip-version-check -r kaggle-worker/requirements-launcher.txt
+      - name: Claim and launch a batch
+        env:
+          BATCH_ID: ${{ github.event.client_payload.batch_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          CF_WORKER_URL: ${{ secrets.CF_WORKER_URL }}
+          CF_LAUNCHER_TOKEN: ${{ secrets.CF_LAUNCHER_TOKEN }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          KAGGLE_KERNEL_OWNER: ${{ secrets.KAGGLE_KERNEL_OWNER }}
+          KAGGLE_KERNEL_SLUG: ${{ secrets.KAGGLE_KERNEL_SLUG }}
+        run: python kaggle-worker/launcher.py

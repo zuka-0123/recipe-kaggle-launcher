@@ -1,0 +1,14 @@
+# Kaggle supplies CUDA-enabled torch. Do not install a CPU torch build here.
+transformers==4.57.1
+accelerate>=1.1,<2
+safetensors>=0.4,<1
+qwen-vl-utils==0.0.14
+faster-whisper>=1.1,<2
+httpx>=0.28,<1
+requests>=2.32,<3
+yt-dlp>=2025.10.22
+youtube-transcript-api>=1.2,<2
+trafilatura>=2.0,<3
+beautifulsoup4>=4.13,<5
+Pillow>=11,<13
+jsonschema>=4.23,<5
