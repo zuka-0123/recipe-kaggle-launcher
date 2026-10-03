@@ -498,6 +498,22 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn('secret-source-and-token', json.dumps(result))
         self.assertTrue(result['error']['retryable'])
 
+    def test_runtime_failures_have_distinct_retry_codes_without_private_data(self):
+        cases = [(RuntimeError('CUDA out of memory private-token'), 'gpu_memory'),
+            (RuntimeError('libcudnn.so not found private-token'), 'cuda_library'),
+            (RuntimeError('model download failed https://private.example'), 'model_download_failed'),
+            (TypeError("unexpected keyword argument 'private-token'"), 'model_api_incompatible'),
+            (TypeError("'NoneType' object is not iterable private-token"), 'model_input_missing'),
+            (RuntimeError('private-token https://private.example'), 'model_load_failed')]
+        for error, code in cases:
+            with self.subTest(code=code):
+                result = worker.error_result({'job_id': 'job-1'}, error)
+                self.assertEqual(result['error']['code'], code)
+                self.assertTrue(result['error']['retryable'])
+                self.assertEqual(result['error']['message'], '無料の解析環境で処理に失敗しました。時間を置いて再試行します。')
+                self.assertNotIn('private-token', json.dumps(result))
+                self.assertNotIn('https://', json.dumps(result))
+
     @unittest.skipUnless(importlib.util.find_spec('jsonschema') and importlib.util.find_spec('trafilatura') and importlib.util.find_spec('youtube_transcript_api'), 'Extractor test dependencies are unavailable')
     def test_job_failure_stage_and_exception_class_only(self):
         from workerlib.extractors import text, youtube

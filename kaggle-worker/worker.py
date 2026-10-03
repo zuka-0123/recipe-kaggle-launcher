@@ -731,14 +731,18 @@ def process_job(job, api, models, settings, root):
         shutil.rmtree(directory, ignore_errors=True)
 
 
-RETRYABLE = {'gpu_unavailable', 'worker_api_failed', 'model_load_failed', 'batch_timeout', 'notebook_failed'}
+RETRYABLE = {'gpu_unavailable', 'worker_api_failed', 'model_load_failed', 'batch_timeout', 'notebook_failed',
+    'gpu_memory', 'cuda_library', 'model_download_failed', 'model_api_incompatible', 'model_input_missing'}
 
 
 def error_result(job, error):
     if isinstance(error, BatchTimeout):
         error = AppError('batch_timeout', '無料GPU batchの処理時間上限に達しました。', 503)
     if not isinstance(error, AppError):
-        error = AppError('model_load_failed', 'GPU処理に失敗しました。quota、メモリ、model取得状況を確認してください。', 503)
+        code = {'gpu_memory': 'gpu_memory', 'cuda_library': 'cuda_library',
+            'model_download': 'model_download_failed', 'api_signature': 'model_api_incompatible',
+            'missing_value': 'model_input_missing'}.get(job_failure_reason(error), 'model_load_failed')
+        error = AppError(code, '無料の解析環境で処理に失敗しました。時間を置いて再試行します。', 503)
     result = {'job_id': job['job_id'], 'error': {'code': error.code, 'message': error.message,
         'retryable': error.code in RETRYABLE}}
     if error.details.get('raw_output'):

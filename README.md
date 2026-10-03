@@ -12,8 +12,7 @@ YouTubeは概要欄と字幕から先に候補を作ります。料理名、材�
 
 無料T4が使えない場合はretry可能なエラーを返します。起動失敗や実行中のNotebookもCloudflareへ通知し、Cloudflareの再試行回数・待ち時間制限に従います。有料GPU、他のaccelerator、Colab、自動課金サービスへのfallbackはありません。無料quota不足を解消する保証はありません。
 
-`python -m unittest discover -s tests -v`で48件すべて合格しました。テストではmodelの取得と推論をmockしています。従来の3B構成では実際のKaggle T4 batchを動作確認に使いましたが、7Bの4bit構成は実GPU検証前です。T4割り当て、modelの初回取得時間、抽出品質、YouTubeの字幕・音声取得も継続して確認します。NotebookへのSecrets登録はKaggle CLIで対応していないため、今回の短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
+`python -m unittest discover -s tests -v`で51件すべて合格しました。テストではmodelの取得と推論をmockしています。従来の3B構成では実際のKaggle T4 batchを動作確認に使いましたが、7Bの4bit構成は実GPU検証前です。T4割り当て、modelの初回取得時間、抽出品質、YouTubeの字幕・音声取得も継続して確認します。NotebookへのSecrets登録はKaggle CLIで対応していないため、今回の短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
 
 Colabで手動デバッグするときは同じworker codeを一時環境に置きます。自動起動や常駐機能はありません。
-
 
