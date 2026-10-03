@@ -44,11 +44,17 @@ class NativePreflightTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 helpers()['select_awq_extension'](wrong)
 
-    def test_nvcc_release_must_match_actual_torch_cuda(self):
+    def test_nvcc_major_must_match_minor_difference_warns_unknown_rejected(self):
         release = helpers()['toolkit_release']
         self.assertEqual(release('Cuda compilation tools, release 12.8, V12.8.93', '12.8'), (12, 8))
-        for output, torch_cuda in [('release 12.4', '12.8'), ('release 13.0', '12.8'),
-                ('private-token', '12.8'), ('release 12.8', None)]:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(release('release 12.4 private-token', '12.8'), (12, 4))
+        self.assertEqual(output.getvalue(),
+            'recipe_preflight stage=toolkit_check warning_cuda_minor_mismatch=1\n')
+        for output, torch_cuda in [('release 13.0', '12.8'), ('release 11.8', '12.8'),
+                ('private-token', '12.8'), ('release 12.8', None),
+                ('release 12.999','12.8'), ('release 12.8','12.8 private-token')]:
             with self.assertRaises(RuntimeError) as error:
                 release(output, torch_cuda)
             self.assertEqual(str(error.exception), 'native_toolkit_mismatch')

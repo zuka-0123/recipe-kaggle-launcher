@@ -49,10 +49,14 @@ def select_awq_extension(source):
         'extensions = [extension for extension in extensions if extension.name == "awq_ext"]\\n' + marker)
 
 def toolkit_release(output, torch_cuda):
-    match = re.search(r'release (\\d+)\\.(\\d+)', output)
-    expected = re.fullmatch(r'(\\d+)\\.(\\d+)', torch_cuda or '')
-    if not match or not expected or match.groups() != expected.groups():
+    match = re.search(r'release (\\d{1,2})\\.(\\d{1,2})(?!\\d)', output) if isinstance(output,str) else None
+    expected = re.fullmatch(r'(\\d{1,2})\\.(\\d{1,2})', torch_cuda) if isinstance(torch_cuda,str) else None
+    if not match or not expected or int(match.group(1)) != int(expected.group(1)):
         raise RuntimeError('native_toolkit_mismatch')
+    # Match Torch's official extension check: a CUDA minor difference is a warning.
+    # Do not bypass its later compiler/version checks or spoof any version values.
+    if int(match.group(2)) != int(expected.group(2)):
+        print('recipe_preflight stage=toolkit_check warning_cuda_minor_mismatch=1',flush=True)
     return tuple(map(int, match.groups()))
 
 def safe_toolkit_diagnostic(output, torch_cuda):
