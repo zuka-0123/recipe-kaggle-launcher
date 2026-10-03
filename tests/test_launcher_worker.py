@@ -1,6 +1,6 @@
 """CPU-only contract tests. Models, network and Kaggle submission are mocked."""
 import datetime as dt
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 import enum
 import importlib.util
 import io
@@ -134,6 +134,108 @@ class LauncherTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def fake_sdpa_modules(self, capability=(7, 5)):
+        entered = []
+        @contextmanager
+        def kernel(*, backends):
+            entered.append(backends)
+            yield
+        hook = lambda *args: True
+        integration = types.SimpleNamespace(use_gqa_in_sdpa=hook)
+        torch = types.SimpleNamespace(__version__='2.8.0+private-build',
+            cuda=types.SimpleNamespace(get_device_capability=lambda _: capability))
+        attention = types.SimpleNamespace(sdpa_kernel=kernel,
+            SDPBackend=types.SimpleNamespace(EFFICIENT_ATTENTION='efficient-only'))
+        modules = {'torch': torch, 'torch.nn.attention': attention,
+            'transformers.integrations': types.SimpleNamespace(sdpa_attention=integration)}
+        return modules, integration, attention, entered, hook
+
+    def test_t4_context_uses_only_efficient_and_restores_gqa_hook(self):
+        modules, integration, _, entered, hook = self.fake_sdpa_modules()
+        with patch.dict(sys.modules, modules):
+            with worker.t4_efficient_sdpa():
+                self.assertFalse(integration.use_gqa_in_sdpa(None, None))
+            self.assertIs(integration.use_gqa_in_sdpa, hook)
+        self.assertEqual(entered, [['efficient-only']])
+
+    def test_t4_context_rejects_unsupported_runtime_without_other_backend(self):
+        for capability, missing_hook in [((8, 0), False), ((7, 5), True)]:
+            modules, integration, _, entered, hook = self.fake_sdpa_modules(capability)
+            if missing_hook:
+                integration.use_gqa_in_sdpa = None
+            with self.subTest(capability=capability, missing_hook=missing_hook), patch.dict(sys.modules, modules):
+                with self.assertRaises(AppError) as caught:
+                    with worker.t4_efficient_sdpa():
+                        self.fail('An incompatible runtime cannot enter generation')
+            self.assertEqual(caught.exception.code, 'model_api_incompatible')
+            self.assertEqual(entered, [])
+
+    def test_t4_context_restores_hook_on_backend_failure_and_oom(self):
+        for message, code in [('No available kernel private-token https://private.example', 'model_api_incompatible'),
+                ('CUDA out of memory private-token', 'gpu_memory')]:
+            modules, integration, _, _, hook = self.fake_sdpa_modules()
+            with self.subTest(code=code), patch.dict(sys.modules, modules):
+                try:
+                    with worker.t4_efficient_sdpa():
+                        raise RuntimeError(message)
+                except Exception as error:
+                    result = worker.error_result({'job_id': 'job-1'}, error)
+                self.assertIs(integration.use_gqa_in_sdpa, hook)
+            self.assertEqual(result['error']['code'], code)
+            self.assertTrue(result['error']['retryable'])
+            self.assertNotIn('private-token', json.dumps(result))
+            self.assertNotIn('https://', json.dumps(result))
+
+    def test_runtime_diagnostics_emit_only_sanitized_version_capability_and_counts(self):
+        modules, _, _, _, _ = self.fake_sdpa_modules()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            worker.safe_runtime_diagnostic(modules['torch'], 1234)
+            worker.safe_runtime_diagnostic(modules['torch'], 1234, 567)
+        self.assertEqual(output.getvalue().splitlines(), [
+            'recipe_runtime torch=2.8 capability=7.5 input_tokens=1234',
+            'recipe_runtime torch=2.8 capability=7.5 input_tokens=1234 output_tokens=567'])
+        self.assertNotIn('private', output.getvalue())
+        modules['torch'].__version__ = 'private-token'
+        modules['torch'].cuda.get_device_capability = lambda _: ('private-token', 5)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            worker.safe_runtime_diagnostic(modules['torch'], 1, 'private-token')
+            worker.safe_runtime_diagnostic(modules['torch'], 'private-token')
+        self.assertEqual(output.getvalue().strip(), 'recipe_runtime torch=unknown capability=unknown input_tokens=1')
+
+    def test_efficient_context_applies_only_to_llm_generate(self):
+        class Inputs(dict):
+            def to(self, device): return self
+        class Output:
+            def __getitem__(self, key): return types.SimpleNamespace(shape=(10,))
+        @contextmanager
+        def inference(): yield
+        entries = []
+        @contextmanager
+        def efficient():
+            entries.append('entered')
+            yield
+        torch = types.SimpleNamespace(inference_mode=inference, __version__='2.8.0',
+            cuda=types.SimpleNamespace(get_device_capability=lambda _: (7, 5)))
+        class Processor:
+            @property
+            def tokenizer(self): return self
+            def apply_chat_template(self, *args, **kwargs): return 'mock input'
+            def __call__(self, *args, **kwargs): return Inputs(input_ids=types.SimpleNamespace(shape=(1, 5)))
+            def decode(self, *args, **kwargs): return '{"title":{"original":"料理"},"ingredients":[],"steps":[]}'
+        for images in [[], [{'path': 'unused.jpg', 'ref_id': 'src_001'}]]:
+            with self.subTest(images=bool(images)):
+                models = worker.Models({}, {}, 'rules', Path('.'), worker.time.time() + 1000)
+                models.model = types.SimpleNamespace(generate=lambda **kwargs: Output())
+                models.processor = Processor()
+                template = {key: 'fixed' for key in ['recipe_id', 'schema_version', 'created_at', 'updated_at']}
+                template['source'] = {}
+                before = len(entries)
+                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), redirect_stdout(io.StringIO()):
+                    models.structure({'images': images, 'evidence': []}, template)
+                self.assertEqual(len(entries) - before, 0 if images else 1)
+
     def fake_model_modules(self):
         torch = types.SimpleNamespace(float16='mock-fp16', cuda=types.SimpleNamespace(
             is_available=lambda: True, empty_cache=Mock()))
@@ -220,15 +322,22 @@ class WorkerTests(unittest.TestCase):
         extraction = {'evidence': [{'ref_id': 'src_001', 'type': 'manual_input', 'text': text}]}
         system, prompt = worker.build_structure_prompts('原典以外を推測しない。', schema, template, extraction)
         full, _ = worker.build_structure_prompts('原典以外を推測しない。', schema, template, extraction, 'full')
-        payload = json.loads(prompt.split('\n')[0])
-        self.assertEqual(payload['evidence'][0]['text'], text)
+        root = json.loads(prompt.split('\n')[1])
+        shapes = {line.split('[]: ', 1)[0]: json.loads(line.split('[]: ', 1)[1])
+            for line in system.split('\n') if '[]: ' in line}
+        self.assertEqual(root, template)
+        self.assertEqual(prompt.count(text), 1)
+        self.assertNotIn(text, system)
+        self.assertNotIn('"template":', prompt)
+        self.assertNotIn('"item_shapes":', prompt)
+        self.assertNotIn('"evidence":', prompt)
         self.assertEqual(template['ingredients'], [])
-        self.assertEqual(payload['item_shapes']['steps']['duration'], {'value': None, 'unit': None, 'raw_text': None})
-        self.assertEqual(payload['item_shapes']['steps']['temperature'], {'value': None, 'unit': None, 'raw_text': None})
-        self.assertIsNone(payload['item_shapes']['steps']['heat'])
-        self.assertEqual(payload['item_shapes']['ingredients']['amount'], {'value': None, 'unit': None, 'raw_text': None})
-        self.assertEqual(payload['item_shapes']['source_refs']['type'], 'manual_input')
-        self.assertEqual(payload['item_shapes']['source_refs']['ref_id'], 'src_001')
+        self.assertEqual(shapes['steps']['duration'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(shapes['steps']['temperature'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertIsNone(shapes['steps']['heat'])
+        self.assertEqual(shapes['ingredients']['amount'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(shapes['source_refs']['type'], 'manual_input')
+        self.assertEqual(shapes['source_refs']['ref_id'], 'src_001')
         self.assertIn('すべてingredients', system)
         self.assertIn('前の工程の火加減を引き継がず', system)
         self.assertIn('raw_text="2人分"', system)
@@ -237,8 +346,32 @@ class WorkerTests(unittest.TestCase):
         self.assertIn('大さじはtbsp', system)
         self.assertIn('amount.value=null、amount.unit=null', system)
         self.assertIn('pinch等のenumにない単位', system)
+        self.assertIn('原典の言語・表記を保持し、翻訳しません', system)
+        self.assertIn('ingredient_id文字列だけの配列', system)
+        self.assertIn('preparationは材料欄に明示された前処理だけ', system)
+        self.assertIn('nutrition_statedは原典の栄養値だけ', system)
         self.assertLess(len(system), len(full))
         self.assertIn('JSON Schema:', full)
+
+    @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists(), 'Canonical Schema is required')
+    def test_prompt_preserves_each_original_body_and_timestamp_once(self):
+        schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
+        template = {'source': {'type': 'youtube', 'url': 'https://example.com/origin'},
+            'ingredients': [], 'steps': []}
+        evidence = [{'ref_id': 'src_001', 'type': 'youtube_description',
+            'text': '  塩「少々」\nマヨネーズ\t適量\n', 'start_seconds': None, 'end_seconds': None},
+            {'ref_id': 'src_002', 'type': 'youtube_transcript',
+            'text': '原文の{記号}と"引用"を保持する。', 'start_seconds': 1.25, 'end_seconds': 3.5}]
+        before = worker.copy.deepcopy(evidence)
+        system, prompt = worker.build_structure_prompts('原典以外を推測しない。', schema, template, {'evidence': evidence})
+        for row in evidence:
+            self.assertEqual(prompt.count(row['text']), 1)
+            self.assertNotIn(row['text'], system)
+        metadata = [json.loads(line.removeprefix('根拠情報: ')) for line in prompt.splitlines() if line.startswith('根拠情報: ')]
+        self.assertEqual(metadata, [{key: value for key, value in row.items() if key != 'text'} for row in evidence])
+        self.assertEqual(prompt.count('https://example.com/origin'), 1)
+        self.assertEqual(json.loads(prompt.split('\n')[1]), template)
+        self.assertEqual(evidence, before)
 
     def test_absence_repairs_preserve_original_raw_output_and_values(self):
         raw = json.dumps({'title': {'original': '原典', 'normalized': ''},
