@@ -21,6 +21,7 @@ import warnings
 from urllib.parse import urlsplit
 
 from workerlib.errors import AppError
+from workerlib.awq_kernel import ensure_native_awq
 
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_BATCH_JSON_BYTES = 8 * 1024 * 1024
@@ -517,19 +518,19 @@ def ensure_awq_import_compat():
 
 @contextmanager
 def awq_gpu_gemm():
-    """Use the T4-probed AutoAWQ Triton kernels without a torch/CPU fallback."""
+    """Use the T4-probed native CUDA kernels without a Triton/CPU fallback."""
     try:
         import importlib
         gemm = importlib.import_module('awq.modules.linear.gemm')
-        if (gemm.TRITON_AVAILABLE is not True
-                or not callable(getattr(gemm, 'awq_gemm_triton', None))
-                or not callable(getattr(gemm, 'awq_dequantize_triton', None))):
+        native = importlib.import_module('awq_ext')
+        if (not callable(getattr(native, 'gemm_forward_cuda', None))
+                or not callable(getattr(native, 'dequantize_weights_cuda', None))):
             raise AttributeError()
         original = (gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned)
     except Exception:
         raise AppError('model_api_incompatible', '無料GPUのAWQ解析方式に対応していません。', 503) from None
     try:
-        gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = None, True, True
+        gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = native, False, True
         yield
     finally:
         gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = original
@@ -591,6 +592,7 @@ class Models:
             options = dict(common)
             if awq:
                 ensure_awq_import_compat()
+                ensure_native_awq(self.root, self.deadline)
                 from transformers import AwqConfig
                 options['quantization_config'] = AwqConfig(bits=4, group_size=128,
                     zero_point=True, version='gemm', backend='autoawq', do_fuse=False)

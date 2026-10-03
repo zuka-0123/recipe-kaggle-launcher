@@ -318,7 +318,8 @@ class WorkerTests(unittest.TestCase):
     def test_rollback_llm_nf4_and_vlm_fp16_release_previous_model(self):
         torch, transformers = self.fake_model_modules()
         models = worker.Models({'llm_model': worker.NF4_MODEL}, {}, 'rules', Path('.'), 10000)
-        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}):
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), patch.object(worker,
+                'ensure_native_awq', side_effect=AssertionError('NF4/VLM must not build native AWQ')):
             models.load('llm')
             transformers.BitsAndBytesConfig.assert_called_once_with(load_in_4bit=True,
                 bnb_4bit_quant_type='nf4', bnb_4bit_compute_dtype='mock-fp16')
@@ -346,8 +347,10 @@ class WorkerTests(unittest.TestCase):
     def test_default_awq_load_keeps_quantized_weights_on_cuda_without_bnb(self):
         torch, transformers = self.fake_model_modules()
         models = worker.Models({'llm_load_in_4bit': True}, {}, 'rules', Path('.'), 10000)
-        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), redirect_stdout(io.StringIO()):
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), patch.object(worker,
+                'ensure_native_awq') as native, redirect_stdout(io.StringIO()):
             models.load('llm')
+        native.assert_called_once_with(Path('.'), 10000)
         transformers.AwqConfig.assert_called_once_with(bits=4, group_size=128,
             zero_point=True, version='gemm', backend='autoawq', do_fuse=False)
         transformers.BitsAndBytesConfig.assert_not_called()
@@ -365,7 +368,8 @@ class WorkerTests(unittest.TestCase):
         transformers.AutoModelForCausalLM.from_pretrained.side_effect = RuntimeError('private-token')
         models = worker.Models({}, {}, 'rules', Path('.'), 10000)
         output = io.StringIO()
-        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), redirect_stdout(output), self.assertRaises(RuntimeError):
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), patch.object(worker,
+                'ensure_native_awq'), redirect_stdout(output), self.assertRaises(RuntimeError):
             models.load('llm')
         self.assertEqual(transformers.AutoModelForCausalLM.from_pretrained.call_count, 1)
         transformers.BitsAndBytesConfig.assert_not_called()
@@ -412,21 +416,24 @@ class WorkerTests(unittest.TestCase):
         transformers.BitsAndBytesConfig.assert_called_once()
         transformers.AwqConfig.assert_not_called()
 
-    def test_awq_triton_path_is_explicit_and_restored_after_success_or_failure(self):
+    def test_awq_native_path_is_explicit_and_restored_after_success_or_failure(self):
         extension = object()
         module = types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
-            user_has_been_warned=False, awq_gemm_triton=Mock(return_value='GPU result'),
-            awq_dequantize_triton=Mock(return_value='GPU weight'),
+            user_has_been_warned=False, awq_gemm_triton=Mock(side_effect=AssertionError('Triton forbidden')),
             dequantize_gemm=Mock(side_effect=AssertionError('torch fallback is forbidden')))
+        native = types.SimpleNamespace(gemm_forward_cuda=Mock(return_value='GPU result'),
+            dequantize_weights_cuda=Mock(return_value='GPU weight'))
         for fail in [False, True]:
-            with self.subTest(fail=fail), patch.dict(sys.modules, {'awq.modules.linear.gemm': module}):
+            with self.subTest(fail=fail), patch.dict(sys.modules,
+                    {'awq.modules.linear.gemm': module, 'awq_ext': native}):
                 try:
                     with worker.awq_gpu_gemm():
-                        self.assertIsNone(module.awq_ext)
-                        self.assertTrue(module.TRITON_AVAILABLE)
+                        self.assertIs(module.awq_ext, native)
+                        self.assertFalse(module.TRITON_AVAILABLE)
                         self.assertTrue(module.user_has_been_warned)
-                        self.assertEqual(module.awq_gemm_triton(), 'GPU result')
-                        self.assertEqual(module.awq_dequantize_triton(), 'GPU weight')
+                        self.assertEqual(module.awq_ext.gemm_forward_cuda(), 'GPU result')
+                        self.assertEqual(module.awq_ext.dequantize_weights_cuda(), 'GPU weight')
+                        module.awq_gemm_triton.assert_not_called()
                         module.dequantize_gemm.assert_not_called()
                         if fail:
                             raise RuntimeError('private-token')
@@ -435,21 +442,28 @@ class WorkerTests(unittest.TestCase):
                 self.assertIs(module.awq_ext, extension)
                 self.assertTrue(module.TRITON_AVAILABLE)
                 self.assertFalse(module.user_has_been_warned)
-        for invalid in [types.SimpleNamespace(),
-                types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=False,
-                    user_has_been_warned=False, awq_gemm_triton=Mock(), awq_dequantize_triton=Mock()),
-                types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
-                    user_has_been_warned=False, awq_gemm_triton=None, awq_dequantize_triton=Mock()),
-                types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
-                    user_has_been_warned=False, awq_gemm_triton=Mock(), awq_dequantize_triton=None)]:
+        for invalid in [None, types.SimpleNamespace(),
+                types.SimpleNamespace(gemm_forward_cuda=None, dequantize_weights_cuda=Mock()),
+                types.SimpleNamespace(gemm_forward_cuda=Mock(), dequantize_weights_cuda=None)]:
             with self.subTest(invalid=invalid), patch.dict(sys.modules,
-                    {'awq.modules.linear.gemm': invalid}), self.assertRaises(AppError) as error:
+                    {'awq.modules.linear.gemm': module, 'awq_ext': invalid}), self.assertRaises(AppError) as error:
                 with worker.awq_gpu_gemm():
-                    self.fail('Unavailable Triton must fail before generation')
+                    self.fail('Unavailable native CUDA must fail before generation')
             self.assertEqual(error.exception.code, 'model_api_incompatible')
-            if hasattr(invalid, 'awq_ext'):
-                self.assertIs(invalid.awq_ext, extension)
-                self.assertFalse(invalid.user_has_been_warned)
+            self.assertIs(module.awq_ext, extension)
+            self.assertTrue(module.TRITON_AVAILABLE)
+            self.assertFalse(module.user_has_been_warned)
+
+    def test_awq_native_install_failure_stops_without_model_or_backend_fallback(self):
+        torch, transformers = self.fake_model_modules()
+        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), patch.object(worker,
+                'ensure_native_awq', side_effect=AppError('model_api_incompatible', '解析環境を準備できません。')), self.assertRaises(AppError) as error:
+            models.load('llm')
+        self.assertEqual(error.exception.code, 'model_api_incompatible')
+        transformers.AutoModelForCausalLM.from_pretrained.assert_not_called()
+        transformers.BitsAndBytesConfig.assert_not_called()
+        transformers.AwqConfig.assert_not_called()
 
     def test_gpu_diagnostic_emits_only_bounded_numbers_and_fixed_stages(self):
         mib = 1024**2
