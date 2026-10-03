@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from launcher import public_repository, LaunchError, status_failure_code
+from launcher import public_repository, kernel_status, LaunchError, status_failure_code
 
 HERE = Path(__file__).resolve().parent
 
@@ -15,8 +15,8 @@ def main():
     if not re.fullmatch(r'[A-Za-z0-9_-]+', owner):
         raise LaunchError('invalid_kernel_ref')
     reference = owner + '/recipe-asr-cpu-diagnosis'
-    # This one-off CPU notebook was verified absent in Kaggle before this push.
-    # Production GPU launches continue to use kernel_status and Cloudflare locks.
+    # It now exists and the first diagnosis is complete; reject an active run.
+    kernel_status(reference)
     requirements = (HERE / 'requirements-worker.txt').read_text(encoding='utf-8')
     code = '''import importlib.metadata, inspect, os, pathlib, subprocess, sys, tempfile, traceback, wave
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'

@@ -5,6 +5,8 @@ accelerate>=1.1,<2
 safetensors>=0.4,<1
 qwen-vl-utils==0.0.14
 faster-whisper>=1.1,<2
+# faster-whisper 1.2.1 decode_audio needs av.open(metadata_errors=...), removed in PyAV 19.
+av==18.1.0
 httpx>=0.28,<1
 requests>=2.32,<3
 yt-dlp>=2025.10.22
