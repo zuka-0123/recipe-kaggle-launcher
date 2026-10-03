@@ -516,18 +516,20 @@ def ensure_awq_import_compat():
 
 
 @contextmanager
-def awq_gpu_dequant():
-    """Select AutoAWQ's GPU torch dequant+matmul path, never external kernels."""
+def awq_gpu_gemm():
+    """Use the T4-probed AutoAWQ Triton kernels without a torch/CPU fallback."""
     try:
         import importlib
         gemm = importlib.import_module('awq.modules.linear.gemm')
-        if not callable(gemm.dequantize_gemm):
+        if (gemm.TRITON_AVAILABLE is not True
+                or not callable(getattr(gemm, 'awq_gemm_triton', None))
+                or not callable(getattr(gemm, 'awq_dequantize_triton', None))):
             raise AttributeError()
         original = (gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned)
     except Exception:
         raise AppError('model_api_incompatible', '無料GPUのAWQ解析方式に対応していません。', 503) from None
     try:
-        gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = None, False, True
+        gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = None, True, True
         yield
     finally:
         gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = original
@@ -661,7 +663,7 @@ class Models:
         except Exception:
             pass
         try:
-            with torch.inference_mode(), (nullcontext() if images else t4_efficient_sdpa()), (awq_gpu_dequant() if awq else nullcontext()):
+            with torch.inference_mode(), (nullcontext() if images else t4_efficient_sdpa()), (awq_gpu_gemm() if awq else nullcontext()):
                 output = self.model.generate(**inputs, max_new_tokens=6144, **sampling,
                     max_time=min(generation_seconds, remaining - 20))
         finally:

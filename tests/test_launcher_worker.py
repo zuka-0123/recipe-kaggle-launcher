@@ -259,7 +259,7 @@ class WorkerTests(unittest.TestCase):
                 template = {key: 'fixed' for key in ['recipe_id', 'schema_version', 'created_at', 'updated_at']}
                 template['source'] = {'type': source_type}
                 before = len(entries)
-                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), patch.object(worker, 'awq_gpu_dequant', nullcontext), patch.object(worker.time, 'time', return_value=1000), redirect_stdout(io.StringIO()):
+                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), patch.object(worker, 'awq_gpu_gemm', nullcontext), patch.object(worker.time, 'time', return_value=1000), redirect_stdout(io.StringIO()):
                     if expected_seconds is None:
                         with self.assertRaises(AppError) as error:
                             models.structure({'images': images, 'evidence': []}, template)
@@ -390,18 +390,22 @@ class WorkerTests(unittest.TestCase):
         transformers.BitsAndBytesConfig.assert_called_once()
         transformers.AwqConfig.assert_not_called()
 
-    def test_awq_dequant_path_is_explicit_and_restored_after_success_or_failure(self):
+    def test_awq_triton_path_is_explicit_and_restored_after_success_or_failure(self):
         extension = object()
         module = types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
-            user_has_been_warned=False, dequantize_gemm=Mock(return_value='GPU weight'))
+            user_has_been_warned=False, awq_gemm_triton=Mock(return_value='GPU result'),
+            awq_dequantize_triton=Mock(return_value='GPU weight'),
+            dequantize_gemm=Mock(side_effect=AssertionError('torch fallback is forbidden')))
         for fail in [False, True]:
             with self.subTest(fail=fail), patch.dict(sys.modules, {'awq.modules.linear.gemm': module}):
                 try:
-                    with worker.awq_gpu_dequant():
+                    with worker.awq_gpu_gemm():
                         self.assertIsNone(module.awq_ext)
-                        self.assertFalse(module.TRITON_AVAILABLE)
+                        self.assertTrue(module.TRITON_AVAILABLE)
                         self.assertTrue(module.user_has_been_warned)
-                        self.assertEqual(module.dequantize_gemm(), 'GPU weight')
+                        self.assertEqual(module.awq_gemm_triton(), 'GPU result')
+                        self.assertEqual(module.awq_dequantize_triton(), 'GPU weight')
+                        module.dequantize_gemm.assert_not_called()
                         if fail:
                             raise RuntimeError('private-token')
                 except RuntimeError:
@@ -409,10 +413,21 @@ class WorkerTests(unittest.TestCase):
                 self.assertIs(module.awq_ext, extension)
                 self.assertTrue(module.TRITON_AVAILABLE)
                 self.assertFalse(module.user_has_been_warned)
-        with patch.dict(sys.modules, {'awq.modules.linear.gemm': types.SimpleNamespace()}), self.assertRaises(AppError) as error:
-            with worker.awq_gpu_dequant():
-                self.fail('Missing AWQ symbols must fail before generation')
-        self.assertEqual(error.exception.code, 'model_api_incompatible')
+        for invalid in [types.SimpleNamespace(),
+                types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=False,
+                    user_has_been_warned=False, awq_gemm_triton=Mock(), awq_dequantize_triton=Mock()),
+                types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
+                    user_has_been_warned=False, awq_gemm_triton=None, awq_dequantize_triton=Mock()),
+                types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
+                    user_has_been_warned=False, awq_gemm_triton=Mock(), awq_dequantize_triton=None)]:
+            with self.subTest(invalid=invalid), patch.dict(sys.modules,
+                    {'awq.modules.linear.gemm': invalid}), self.assertRaises(AppError) as error:
+                with worker.awq_gpu_gemm():
+                    self.fail('Unavailable Triton must fail before generation')
+            self.assertEqual(error.exception.code, 'model_api_incompatible')
+            if hasattr(invalid, 'awq_ext'):
+                self.assertIs(invalid.awq_ext, extension)
+                self.assertFalse(invalid.user_has_been_warned)
 
     def test_gpu_diagnostic_emits_only_bounded_numbers_and_fixed_stages(self):
         mib = 1024**2
