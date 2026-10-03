@@ -10,7 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'kaggle-worker'))
@@ -134,6 +134,84 @@ class LauncherTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def fake_model_modules(self):
+        torch = types.SimpleNamespace(float16='mock-fp16', cuda=types.SimpleNamespace(
+            is_available=lambda: True, empty_cache=Mock()))
+        transformer = types.SimpleNamespace(BitsAndBytesConfig=Mock(return_value='mock-nf4'),
+            AutoTokenizer=types.SimpleNamespace(from_pretrained=Mock(return_value='mock-tokenizer')),
+            AutoProcessor=types.SimpleNamespace(from_pretrained=Mock(return_value='mock-processor')),
+            AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=Mock(return_value=types.SimpleNamespace(eval=Mock()))),
+            Qwen2_5_VLForConditionalGeneration=types.SimpleNamespace(from_pretrained=Mock(return_value=types.SimpleNamespace(eval=Mock()))))
+        return torch, transformer
+
+    def test_default_llm_nf4_and_vlm_fp16_release_previous_model(self):
+        torch, transformers = self.fake_model_modules()
+        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}):
+            models.load('llm')
+            transformers.BitsAndBytesConfig.assert_called_once_with(load_in_4bit=True,
+                bnb_4bit_quant_type='nf4', bnb_4bit_compute_dtype='mock-fp16')
+            llm_call = transformers.AutoModelForCausalLM.from_pretrained.call_args
+            self.assertEqual(llm_call.args, ('Qwen/Qwen2.5-7B-Instruct',))
+            self.assertEqual(llm_call.kwargs['quantization_config'], 'mock-nf4')
+            self.assertEqual(llm_call.kwargs['device_map'], {'': 'cuda:0'})
+            self.assertFalse(llm_call.kwargs['trust_remote_code'])
+            self.assertTrue(llm_call.kwargs['use_safetensors'])
+            models.load('llm')
+            self.assertEqual(transformers.AutoModelForCausalLM.from_pretrained.call_count, 1)
+            def vlm_load(*args, **kwargs):
+                self.assertIsNone(models.model)
+                self.assertIsNone(models.kind)
+                self.assertEqual(args, ('Qwen/Qwen2.5-VL-3B-Instruct',))
+                self.assertNotIn('quantization_config', kwargs)
+                self.assertEqual(kwargs['torch_dtype'], 'mock-fp16')
+                self.assertEqual(kwargs['device_map'], {'': 'cuda:0'})
+                return types.SimpleNamespace(eval=Mock())
+            transformers.Qwen2_5_VLForConditionalGeneration.from_pretrained.side_effect = vlm_load
+            models.load('vlm')
+            self.assertEqual(models.kind, 'vlm')
+            self.assertEqual(torch.cuda.empty_cache.call_count, 2)
+
+    def test_explicit_false_disables_quantization_without_a_fallback(self):
+        torch, transformers = self.fake_model_modules()
+        models = worker.Models({'llm_load_in_4bit': False}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}):
+            models.load('llm')
+        transformers.BitsAndBytesConfig.assert_not_called()
+        self.assertNotIn('quantization_config', transformers.AutoModelForCausalLM.from_pretrained.call_args.kwargs)
+
+    def test_non_boolean_quantization_setting_fails_before_model_download(self):
+        torch, transformers = self.fake_model_modules()
+        for value in ['true', 1, 0, None]:
+            models = worker.Models({'llm_load_in_4bit': value}, {}, 'rules', Path('.'), 10000)
+            with self.subTest(value=value), patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), self.assertRaises(AppError):
+                models.load('llm')
+        transformers.AutoTokenizer.from_pretrained.assert_not_called()
+        transformers.AutoModelForCausalLM.from_pretrained.assert_not_called()
+
+    def test_quantized_load_failure_stops_without_retrying_unquantized(self):
+        torch, transformers = self.fake_model_modules()
+        failure = RuntimeError('private-token quantization CUDA failure')
+        transformers.AutoModelForCausalLM.from_pretrained.side_effect = failure
+        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), self.assertRaises(RuntimeError):
+            models.load('llm')
+        transformers.AutoModelForCausalLM.from_pretrained.assert_called_once()
+        self.assertIsNone(models.kind)
+        result = worker.error_result({'job_id': 'job-1'}, failure)
+        self.assertEqual(result['error']['code'], 'model_load_failed')
+        self.assertTrue(result['error']['retryable'])
+        self.assertNotIn('private-token', json.dumps(result))
+
+    def test_images_use_full_schema_and_text_uses_compact_prompt(self):
+        for images, mode in [([], 'compact'), ([{'path': 'unused.jpg'}], 'full')]:
+            with self.subTest(mode=mode):
+                models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+                with patch.dict(sys.modules, {'torch': types.SimpleNamespace()}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', side_effect=RuntimeError('stop before inference')) as build:
+                    with self.assertRaises(RuntimeError):
+                        models.structure({'images': images, 'evidence': []}, {'source': {}})
+                self.assertEqual(build.call_args.args[-1], mode)
+
     @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists(), 'Main workspace Canonical Schema is required for this contract test')
     def test_compact_prompt_keeps_complete_array_shapes_and_enums(self):
         schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
@@ -181,6 +259,81 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNone(repaired['title']['normalized'])
         self.assertIsNone(repaired['ingredients'][0]['name']['normalized'])
         self.assertIsNone(json.loads(raw)['steps'][0]['duration'])
+
+    @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists() and importlib.util.find_spec('jsonschema'), 'Canonical Schema and validator are required')
+    def test_sparse_recipe_shape_is_complete_without_inventing_content(self):
+        from jsonschema import Draft202012Validator
+        schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
+        sparse = {'schema_version': '1.0', 'recipe_id': 'rec_test',
+            'title': {'original': '原典料理'},
+            'source': {'type': 'text', 'url': None, 'source_id': None, 'title': None,
+                'creator': None, 'retrieved_at': '2026-10-03T00:00:00Z'},
+            'ingredients': [{'name': {'raw': f'材料{i}'},
+                'amount': {'raw_text': '適量'}} for i in range(6)],
+            'steps': [{'instruction': f'原典の工程{i}'} for i in range(3)],
+            'created_at': '2026-10-03T00:00:00Z', 'updated_at': '2026-10-03T00:00:00Z'}
+        raw = json.dumps(sparse, ensure_ascii=False)
+        candidate = worker.parse_json(raw)
+        worker.complete_required_shape(candidate, schema)
+        self.assertEqual(list(Draft202012Validator(schema).iter_errors(candidate)), [])
+        self.assertEqual(len(candidate['ingredients']), 6)
+        self.assertEqual(len(candidate['steps']), 3)
+        self.assertEqual([i['ingredient_id'] for i in candidate['ingredients']], [f'ing_{i:03d}' for i in range(1, 7)])
+        self.assertEqual([i['step'] for i in candidate['steps']], [1, 2, 3])
+        for item in candidate['ingredients']:
+            self.assertFalse(item['optional'])
+            self.assertIsNone(item['preparation'])
+            self.assertIsNone(item['note'])
+            self.assertIsNone(item['source_ref'])
+            self.assertEqual(item['amount'], {'raw_text': '適量', 'value': None, 'unit': None})
+        self.assertEqual(candidate['steps'][0]['duration'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertEqual(candidate['steps'][0]['temperature'], {'value': None, 'unit': None, 'raw_text': None})
+        self.assertIsNone(candidate['steps'][0]['heat'])
+        self.assertEqual(candidate['source_refs'], [])
+        self.assertEqual(candidate['storage'], {'refrigerated': None, 'frozen': None, 'raw_text': None})
+        self.assertEqual(json.loads(raw), sparse)
+        before = worker.copy.deepcopy(candidate)
+        worker.complete_required_shape(candidate, schema)
+        self.assertEqual(candidate, before)
+
+    @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists(), 'Canonical Schema is required')
+    def test_shape_completion_preserves_bad_types_extra_keys_and_existing_ids(self):
+        schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
+        candidate = {'title': 'wrong type', 'ingredients': [
+            {'ingredient_id': 'ing_001', 'optional': True, 'name': {'raw': '塩'},
+                'amount': {'value': '1', 'unit': 'pinch'}, 'extra': 'keep'},
+            {'name': {'raw': '油'}, 'optional': None},
+            {'ingredient_id': 'ing_002', 'name': {'raw': '卵'}, 'preparation': 7},
+            {'ingredient_id': None, 'name': []}, {'name': {'raw': '水'}}],
+            'steps': [{'step': 9, 'instruction': '原典', 'duration': 'invalid'},
+                {'instruction': '原典', 'temperature': []}], 'extra': {'keep': True}}
+        worker.complete_required_shape(candidate, schema)
+        self.assertEqual(candidate['title'], 'wrong type')
+        self.assertEqual([i['ingredient_id'] for i in candidate['ingredients']], ['ing_001', 'ing_003', 'ing_002', None, 'ing_004'])
+        self.assertTrue(candidate['ingredients'][0]['optional'])
+        self.assertIsNone(candidate['ingredients'][1]['optional'])
+        self.assertEqual(candidate['ingredients'][0]['amount'], {'value': '1', 'unit': 'pinch', 'raw_text': None})
+        self.assertEqual(candidate['ingredients'][0]['extra'], 'keep')
+        self.assertEqual(candidate['ingredients'][2]['preparation'], 7)
+        self.assertEqual(candidate['ingredients'][3]['name'], [])
+        self.assertEqual([i['step'] for i in candidate['steps']], [9, 2])
+        self.assertEqual(candidate['steps'][0]['duration'], 'invalid')
+        self.assertEqual(candidate['steps'][1]['temperature'], [])
+        self.assertEqual(candidate['extra'], {'keep': True})
+
+    @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists() and importlib.util.find_spec('jsonschema'), 'Canonical Schema and validator are required')
+    def test_missing_original_text_remains_blank_and_fails_schema_validation(self):
+        from jsonschema import Draft202012Validator
+        schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
+        candidate = {'ingredients': [{}], 'steps': [{}]}
+        worker.complete_required_shape(candidate, schema)
+        self.assertEqual(candidate['title']['original'], '')
+        self.assertEqual(candidate['ingredients'][0]['name']['raw'], '')
+        self.assertEqual(candidate['steps'][0]['instruction'], '')
+        paths = {tuple(error.path) for error in Draft202012Validator(schema).iter_errors(candidate)}
+        self.assertIn(('title', 'original'), paths)
+        self.assertIn(('ingredients', 0, 'name', 'raw'), paths)
+        self.assertIn(('steps', 0, 'instruction'), paths)
 
     def test_bootstrap_and_failure_report_import_without_site_packages(self):
         script = 'import sys; sys.path.insert(0, ' + repr(str(ROOT / 'kaggle-worker')) + '); from worker import bootstrap, fail_batch, BatchAPI; print("stdlib-bootstrap-import-ok")'
@@ -365,14 +518,14 @@ class WorkerTests(unittest.TestCase):
                 with patch.object(text, 'extract_text', side_effect=private_error if stage == 'extract' else None, return_value=extraction), patch.object(youtube, 'extract_youtube', return_value=extraction), patch.object(youtube, 'download_audio', return_value=Path('unused.mp3')), patch.object(youtube, 'frames', side_effect=private_error), redirect_stdout(output):
                     with self.assertRaises(RuntimeError):
                         worker.process_job(job, None, models, worker.settings_from({}, Path(temporary)), Path(temporary))
-                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage={stage} exception=RuntimeError reason=runtime_other')
+                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage={stage} exception=RuntimeError reason=runtime_other last_frame=other')
 
     def test_job_diagnostic_keeps_cuda_exception_class_without_message(self):
         OutOfMemoryError = type('OutOfMemoryError', (RuntimeError,), {})
         output = io.StringIO()
         with redirect_stdout(output):
             worker.safe_job_diagnostic('structure', OutOfMemoryError('secret tensor/source details'))
-        self.assertEqual(output.getvalue().strip(), 'recipe_job_diag stage=structure exception=OutOfMemoryError reason=gpu_memory')
+        self.assertEqual(output.getvalue().strip(), 'recipe_job_diag stage=structure exception=OutOfMemoryError reason=gpu_memory last_frame=no_traceback')
 
     def test_job_reason_labels_never_expose_error_text(self):
         cases = [('CUDA out of memory: private-token https://private.example', 'gpu_memory'),
@@ -386,9 +539,60 @@ class WorkerTests(unittest.TestCase):
                 output = io.StringIO()
                 with redirect_stdout(output):
                     worker.safe_job_diagnostic('asr', RuntimeError(message))
-                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage=asr exception=RuntimeError reason={reason}')
+                self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage=asr exception=RuntimeError reason={reason} last_frame=no_traceback')
                 self.assertNotIn('private-token', output.getvalue())
                 self.assertNotIn('https://', output.getvalue())
+
+    def test_typeerror_reason_and_last_frame_only_emit_fixed_labels(self):
+        cases = [("got an unexpected keyword argument 'private-token'", 'api_signature'),
+            ('incompatible function arguments: https://private.example', 'api_signature'),
+            ("'NoneType' object is not iterable private-token", 'missing_value'),
+            ("argument must be str, not NoneType private-token", 'missing_value'),
+            ('private-token https://private.example arbitrary failure', 'runtime_other')]
+        for message, reason in cases:
+            def transcribe():
+                raise TypeError(message)
+            output = io.StringIO()
+            with self.subTest(reason=reason), redirect_stdout(output):
+                try:
+                    transcribe()
+                except TypeError as error:
+                    worker.safe_job_diagnostic('asr', error)
+            self.assertEqual(output.getvalue().strip(), f'recipe_job_diag stage=asr exception=TypeError reason={reason} last_frame=transcribe')
+            self.assertNotIn('private-token', output.getvalue())
+            self.assertNotIn('https://', output.getvalue())
+        scope = {}
+        exec(compile('def private_token_function():\n raise TypeError("private-token")',
+            'https://private.example/secret-file', 'exec'), scope)
+        try:
+            scope['private_token_function']()
+        except TypeError as error:
+            output = io.StringIO()
+            with redirect_stdout(output):
+                worker.safe_job_diagnostic('asr', error)
+            self.assertTrue(output.getvalue().strip().endswith('last_frame=other'))
+            self.assertNotIn('private', output.getvalue())
+
+    def test_transcribe_uses_official_gpu_signature_and_consumes_segment_generator(self):
+        calls = []
+        consumed = []
+        class WhisperModel:
+            def __init__(self, model_size_or_path, device='auto', device_index=0,
+                    compute_type='default', download_root=None):
+                calls.append((model_size_or_path, device, device_index, compute_type, download_root))
+            def transcribe(self, audio, beam_size=5, vad_filter=False):
+                calls.append((audio, beam_size, vad_filter))
+                def segments():
+                    consumed.append(True)
+                    yield types.SimpleNamespace(text='原典音声', start=2.5, end=4.0)
+                return segments(), None
+        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'faster_whisper': types.SimpleNamespace(WhisperModel=WhisperModel)}), patch.object(models, 'unload'):
+            result = models.transcribe(Path('test.mp3'))
+        self.assertEqual(calls[0][:4], ('small', 'cuda', 0, 'int8_float16'))
+        self.assertEqual(calls[1], ('test.mp3', 5, True))
+        self.assertEqual(consumed, [True])
+        self.assertEqual(result, [{'text': '原典音声', 'start': 2.5, 'end': 4.0}])
 
     def test_quota_failure_posts_all_results_and_finishes(self):
         records = []

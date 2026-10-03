@@ -1,5 +1,6 @@
 # Kaggle supplies CUDA-enabled torch. Do not install a CPU torch build here.
 transformers==4.57.1
+bitsandbytes==0.48.1
 accelerate>=1.1,<2
 safetensors>=0.4,<1
 qwen-vl-utils==0.0.14

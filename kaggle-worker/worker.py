@@ -356,6 +356,76 @@ def repair_literal_absence(candidate):
     return candidate
 
 
+def complete_required_shape(candidate, schema):
+    """Fill absent structure only; keep all existing evidence values untouched."""
+    if not isinstance(candidate, dict):
+        return candidate
+
+    def structural_node(node, value=None):
+        node = resolve_schema(node, schema)
+        for branch in node.get('anyOf', []):
+            resolved = resolve_schema(branch, schema)
+            if isinstance(value, dict) and 'properties' in resolved:
+                return resolved
+            if isinstance(value, list) and resolved.get('type') == 'array':
+                return resolved
+        return node
+
+    def unknown(node):
+        node = resolve_schema(node, schema)
+        types = node.get('type', [])
+        types = [types] if isinstance(types, str) else types
+        if 'null' in types or any(resolve_schema(branch, schema).get('type') == 'null'
+                for branch in node.get('anyOf', [])):
+            return None
+        if 'properties' in node:
+            return {key: unknown(node['properties'][key]) for key in node.get('required', [])}
+        if 'array' in types:
+            return []
+        # Blank source text stays visibly missing and fails formal validation.
+        # Never choose an enum, number, boolean or nonblank string as evidence.
+        return '' if 'string' in types else None
+
+    def fill(value, node):
+        node = structural_node(node, value)
+        if isinstance(value, dict):
+            properties = node.get('properties', {})
+            for key in node.get('required', []):
+                if key not in value and key in properties:
+                    value[key] = unknown(properties[key])
+            for key, child in properties.items():
+                if key in value:
+                    fill(value[key], child)
+        elif isinstance(value, list) and isinstance(node.get('items'), dict):
+            for item in value:
+                fill(item, node['items'])
+
+    ingredients = candidate.get('ingredients')
+    if isinstance(ingredients, list):
+        existing_ids = {item['ingredient_id'] for item in ingredients if isinstance(item, dict)
+            and isinstance(item.get('ingredient_id'), str)}
+        next_id = 1
+        for item in ingredients:
+            if not isinstance(item, dict):
+                continue
+            if 'ingredient_id' not in item:
+                while f'ing_{next_id:03d}' in existing_ids:
+                    next_id += 1
+                item['ingredient_id'] = f'ing_{next_id:03d}'
+                existing_ids.add(item['ingredient_id'])
+                next_id += 1
+            if 'optional' not in item:
+                # Canonical v1 explicitly defaults to false absent an optional statement.
+                item['optional'] = False
+    steps = candidate.get('steps')
+    if isinstance(steps, list):
+        for index, item in enumerate(steps, 1):
+            if isinstance(item, dict) and 'step' not in item:
+                item['step'] = index
+    fill(candidate, schema)
+    return candidate
+
+
 class Models:
     """Only one LLM, VLM or ASR is resident at a time; retain across equal jobs."""
     def __init__(self, config, schema, rules, root, deadline):
@@ -372,6 +442,9 @@ class Models:
             torch.cuda.empty_cache()
 
     def load(self, kind):
+        four_bit = self.config.get('llm_load_in_4bit', True)
+        if kind == 'llm' and type(four_bit) is not bool:
+            raise AppError('invalid_model', 'llm_load_in_4bitにはbooleanを指定してください。')
         if self.kind == kind:
             return
         self.unload()
@@ -381,9 +454,14 @@ class Models:
             'use_safetensors': True, 'torch_dtype': torch.float16,
             'device_map': {'': 'cuda:0'}, 'attn_implementation': 'sdpa'}
         if kind == 'llm':
-            name = model_name(self.config.get('llm_model'), 'Qwen/Qwen2.5-3B-Instruct')
+            name = model_name(self.config.get('llm_model'), 'Qwen/Qwen2.5-7B-Instruct')
+            options = dict(common)
+            if four_bit:
+                from transformers import BitsAndBytesConfig
+                options['quantization_config'] = BitsAndBytesConfig(load_in_4bit=True,
+                    bnb_4bit_quant_type='nf4', bnb_4bit_compute_dtype=torch.float16)
             self.processor = AutoTokenizer.from_pretrained(name, trust_remote_code=False, cache_dir=common['cache_dir'])
-            self.model = AutoModelForCausalLM.from_pretrained(name, **common)
+            self.model = AutoModelForCausalLM.from_pretrained(name, **options)
         elif kind == 'vlm':
             name = model_name(self.config.get('vlm_model'), 'Qwen/Qwen2.5-VL-3B-Instruct')
             self.processor = AutoProcessor.from_pretrained(name, trust_remote_code=False,
@@ -398,8 +476,9 @@ class Models:
         import torch
         images = extraction.get('images', [])
         self.load('vlm' if images else 'llm')
+        schema_mode = 'full' if images else self.config.get('prompt_schema_mode', 'compact')
         system, prompt = build_structure_prompts(self.rules, self.schema, template, extraction,
-            self.config.get('prompt_schema_mode', 'compact'))
+            schema_mode)
         if images:
             from qwen_vl_utils import process_vision_info
             content = [{'type': 'text', 'text': prompt}]
@@ -436,6 +515,7 @@ class Models:
             candidate[key] = copy.deepcopy(template[key])
         candidate['user_corrections'] = []
         repair_literal_absence(candidate)
+        complete_required_shape(candidate, self.schema)
         enforce_evidence(candidate, extraction['evidence'])
         return candidate, raw[:MAX_OUTPUT_CHARS]
 
@@ -531,7 +611,33 @@ def job_failure_reason(error):
             'cannot find the requested files in the disk cache', 'gated repo',
             'failed to download model', 'model download failed']):
         return 'model_download'
+    if isinstance(error, TypeError):
+        if any(label in message for label in ['unexpected keyword argument',
+                'incompatible function arguments', 'required positional argument',
+                'required keyword-only argument']) or re.search(r'takes \d+ positional arguments? but \d+ (?:was|were) given', message):
+            return 'api_signature'
+        if any(label in message for label in ["'nonetype' object is not iterable",
+                "'nonetype' object is not subscriptable", "object of type 'nonetype' has no len()",
+                'not nonetype']):
+            return 'missing_value'
     return 'runtime_other'
+
+
+def job_failure_frame(error):
+    """Only fixed function labels, never filenames, locals or traceback text."""
+    frame_labels = {'transcribe': 'transcribe', 'append_transcript': 'append_transcript',
+        'evidence': 'evidence', 'decode_audio': 'decode_audio', 'download_model': 'download_model',
+        'get_speech_timestamps': 'get_speech_timestamps', 'get_vad_model': 'get_vad_model',
+        'generate_segments': 'generate_segments', 'generate_with_fallback': 'generate_with_fallback',
+        'detect_language': 'detect_language', 'encode': 'encode', 'generate': 'generate',
+        'structure': 'structure', 'process_job': 'process_job', '__init__': 'constructor',
+        '__call__': 'call'}
+    tb = error.__traceback__
+    if tb is None:
+        return 'no_traceback'
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    return frame_labels.get(tb.tb_frame.f_code.co_name, 'other')
 
 
 def safe_job_diagnostic(stage, error):
@@ -539,7 +645,8 @@ def safe_job_diagnostic(stage, error):
     kind = type(error).__name__
     if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', kind):
         kind = 'Exception'
-    print('recipe_job_diag stage=' + stage + ' exception=' + kind + ' reason=' + job_failure_reason(error), flush=True)
+    print('recipe_job_diag stage=' + stage + ' exception=' + kind + ' reason=' + job_failure_reason(error)
+        + ' last_frame=' + job_failure_frame(error), flush=True)
 
 
 def process_job(job, api, models, settings, root):
