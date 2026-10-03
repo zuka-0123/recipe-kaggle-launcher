@@ -283,6 +283,26 @@ class WorkerTests(unittest.TestCase):
                 else:
                     self.assertNotIn('enable_thinking', chat_calls[-1])
 
+    def test_generation_cutoff_keeps_raw_and_distinguishes_invalid_json(self):
+        class Inputs(dict):
+            def to(self, _): return self
+        class Output:
+            def __getitem__(self, _): return types.SimpleNamespace(shape=(output_count,))
+        torch = types.SimpleNamespace(inference_mode=nullcontext, manual_seed=Mock(),
+            cuda=types.SimpleNamespace(), __version__='2.10')
+        for elapsed, output_count, limited in [(1200.1, 2242, True), (50, 6144, True), (50, 32, False)]:
+            with self.subTest(elapsed=elapsed, count=output_count):
+                models = worker.Models({'llm_model': worker.QWEN3_AWQ_MODEL}, {}, 'rules', Path('.'), 4000)
+                models.model = types.SimpleNamespace(generate=Mock(return_value=Output()))
+                models.processor = Mock(return_value=Inputs(input_ids=types.SimpleNamespace(shape=(1, 6889))))
+                models.processor.decode.return_value = '{"title":'
+                with patch.dict(sys.modules, {'torch': torch}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', nullcontext), patch.object(worker, 'awq_gpu_gemm', nullcontext), patch.object(worker.time, 'time', return_value=1000), patch.object(worker.time, 'monotonic', side_effect=[0, elapsed]), redirect_stdout(io.StringIO()):
+                    with self.assertRaises(AppError) as caught:
+                        models.structure({'evidence': []}, {'source': {'type': 'youtube'}})
+                self.assertEqual(caught.exception.code, 'llm_not_json')
+                self.assertEqual(caught.exception.details['raw_output'], '{"title":')
+                self.assertEqual(bool(caught.exception.details.get('generation_limit_reached')), limited)
+
     def fake_model_modules(self):
         torch = types.SimpleNamespace(float16='mock-fp16', cuda=types.SimpleNamespace(
             is_available=lambda: True, empty_cache=Mock()))
@@ -1081,6 +1101,22 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(result['candidate']['source']['title'], '取得した動画名')
             self.assertEqual(result['candidate']['source']['creator'], '取得したchannel')
             self.assertEqual(result['evidence'][-1]['type'], 'youtube_speech')
+
+    @unittest.skipUnless(importlib.util.find_spec('jsonschema') and importlib.util.find_spec('trafilatura') and importlib.util.find_spec('youtube_transcript_api'), 'Extractor test dependencies are unavailable')
+    def test_youtube_generation_cutoff_does_not_request_audio_or_frames(self):
+        from workerlib.extractors import youtube
+        extraction = {'evidence': [{'ref_id': 'src_001', 'type': 'youtube_transcript', 'text': '原典', 'start_seconds': 0, 'end_seconds': 1}],
+            'warnings': [], 'images': [], 'video_url': 'https://www.youtube.com/watch?v=abcdefghijk'}
+        failure = AppError('llm_not_json', 'JSON途中切れ', details={'raw_output': '{', 'generation_limit_reached': True})
+        models = types.SimpleNamespace(schema={}, structure=Mock(side_effect=failure))
+        job = {'job_id': 'job-1', 'input_type': 'youtube', 'input': {'value': extraction['video_url'], 'allow_asr': True, 'frame_seconds': [3]}, 'template': {'source': {}}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(youtube, 'extract_youtube', return_value=extraction), patch.object(youtube, 'download_audio') as audio, patch.object(youtube, 'frames') as frames, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            with self.assertRaises(AppError) as caught:
+                worker.process_job(job, None, models, worker.settings_from({}, root), root)
+            self.assertIs(caught.exception, failure)
+            audio.assert_not_called()
+            frames.assert_not_called()
 
     @unittest.skipUnless(importlib.util.find_spec('jsonschema') and importlib.util.find_spec('trafilatura') and importlib.util.find_spec('youtube_transcript_api'), 'Extractor test dependencies are unavailable')
     def test_six_explicit_frames_only_for_incomplete_candidate(self):

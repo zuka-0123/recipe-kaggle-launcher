@@ -657,6 +657,7 @@ class Models:
             'top_k': 20, 'min_p': 0.0} if awq else {'do_sample': False}
         if awq:
             torch.manual_seed(AWQ_SAMPLING_SEED)
+        generation_budget = min(generation_seconds, remaining - 20)
         started = time.monotonic()
         try:
             torch.cuda.reset_peak_memory_stats(0)
@@ -665,15 +666,22 @@ class Models:
         try:
             with torch.inference_mode(), (nullcontext() if images else t4_efficient_sdpa()), (awq_gpu_gemm() if awq else nullcontext()):
                 output = self.model.generate(**inputs, max_new_tokens=6144, **sampling,
-                    max_time=min(generation_seconds, remaining - 20))
+                    max_time=generation_budget)
         finally:
-            safe_gpu_diagnostic(torch, 'generate', time.monotonic() - started)
+            elapsed = time.monotonic() - started
+            safe_gpu_diagnostic(torch, 'generate', elapsed)
         generated = output[0, tokens:]
         safe_runtime_diagnostic(torch, tokens, generated.shape[-1])
         decoder = self.processor.tokenizer if images else self.processor
         raw = decoder.decode(generated, skip_special_tokens=True)
         del inputs, output
-        candidate = parse_json(raw)
+        try:
+            candidate = parse_json(raw)
+        except AppError as error:
+            if error.code == 'llm_not_json' and (generated.shape[-1] >= 6144 or elapsed >= generation_budget):
+                # A generation cutoff is not evidence that the source lacks facts.
+                error.details['generation_limit_reached'] = True
+            raise
         # IDs and origin metadata belong to this job, never to a generated answer.
         for key in ['recipe_id', 'schema_version', 'created_at', 'updated_at', 'source']:
             candidate[key] = copy.deepcopy(template[key])
@@ -851,7 +859,9 @@ def process_job(job, api, models, settings, root):
             try:
                 candidate, raw = models.structure(extraction, template)
             except AppError as error:
-                if kind != 'youtube' or error.code != 'llm_not_json' or not (job['input'].get('allow_asr', True) or requested):
+                if (kind != 'youtube' or error.code != 'llm_not_json'
+                        or error.details.get('generation_limit_reached')
+                        or not (job['input'].get('allow_asr', True) or requested)):
                     raise
                 safe_job_diagnostic(stage, error)
                 # A malformed text candidate can still mean insufficient subtitles.
