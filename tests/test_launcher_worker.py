@@ -286,6 +286,7 @@ class WorkerTests(unittest.TestCase):
             is_available=lambda: True, empty_cache=Mock()))
         transformer = types.SimpleNamespace(BitsAndBytesConfig=Mock(return_value='mock-nf4'),
             AwqConfig=Mock(return_value='mock-awq'),
+            activations=types.SimpleNamespace(GELUTanh=Mock()),
             AutoTokenizer=types.SimpleNamespace(from_pretrained=Mock(return_value='mock-tokenizer')),
             AutoProcessor=types.SimpleNamespace(from_pretrained=Mock(return_value='mock-processor')),
             AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=Mock(return_value=types.SimpleNamespace(eval=Mock()))),
@@ -349,6 +350,45 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNone(models.model)
         self.assertIsNone(models.kind)
         self.assertNotIn('private-token', output.getvalue())
+
+    def test_awq_import_alias_is_added_once_and_existing_alias_is_preserved(self):
+        gelu = Mock()
+        activations = types.SimpleNamespace(GELUTanh=gelu)
+        transformers = types.SimpleNamespace(activations=activations)
+        with patch.dict(sys.modules, {'transformers': transformers}):
+            worker.ensure_awq_import_compat()
+            self.assertIs(activations.PytorchGELUTanh, gelu)
+            worker.ensure_awq_import_compat()
+            self.assertIs(activations.PytorchGELUTanh, gelu)
+            existing = object()
+            activations.PytorchGELUTanh = existing
+            worker.ensure_awq_import_compat()
+            self.assertIs(activations.PytorchGELUTanh, existing)
+        gelu.assert_not_called()
+
+    def test_awq_missing_gelu_class_stops_before_loading_model(self):
+        for missing in [types.SimpleNamespace(), types.SimpleNamespace(GELUTanh=None),
+                types.SimpleNamespace(GELUTanh='private-token')]:
+            torch, transformers = self.fake_model_modules()
+            transformers.activations = missing
+            models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+            output = io.StringIO()
+            with self.subTest(activations=missing), patch.dict(sys.modules,
+                    {'torch': torch, 'transformers': transformers}), redirect_stdout(output), self.assertRaises(AppError) as error:
+                models.load('llm')
+            self.assertEqual(error.exception.code, 'model_api_incompatible')
+            self.assertNotIn('private-token', error.exception.message + output.getvalue())
+            transformers.AutoModelForCausalLM.from_pretrained.assert_not_called()
+
+    def test_nf4_rollback_does_not_import_or_patch_awq_activation_alias(self):
+        torch, transformers = self.fake_model_modules()
+        del transformers.activations
+        models = worker.Models({'llm_model': worker.NF4_MODEL}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), patch.object(worker,
+                'ensure_awq_import_compat', side_effect=AssertionError('AWQ helper must not run for NF4')), redirect_stdout(io.StringIO()):
+            models.load('llm')
+        transformers.BitsAndBytesConfig.assert_called_once()
+        transformers.AwqConfig.assert_not_called()
 
     def test_awq_dequant_path_is_explicit_and_restored_after_success_or_failure(self):
         extension = object()

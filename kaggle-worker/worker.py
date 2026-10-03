@@ -500,6 +500,21 @@ NF4_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
 AWQ_SAMPLING_SEED = 42
 
 
+def ensure_awq_import_compat():
+    """Backport HF's official class-name alias for AutoAWQ's unused quantizer import."""
+    try:
+        from transformers import activations
+        if hasattr(activations, 'PytorchGELUTanh'):
+            return
+        # HF main uses exactly this alias; Qwen3's SiLU and model weights are untouched.
+        # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py
+        if not callable(getattr(activations, 'GELUTanh', None)):
+            raise AttributeError()
+        activations.PytorchGELUTanh = activations.GELUTanh
+    except Exception:
+        raise AppError('model_api_incompatible', '無料GPUのAWQライブラリを読み込めません。', 503) from None
+
+
 @contextmanager
 def awq_gpu_dequant():
     """Select AutoAWQ's GPU torch dequant+matmul path, never external kernels."""
@@ -573,6 +588,7 @@ class Models:
             name = self.llm_name
             options = dict(common)
             if awq:
+                ensure_awq_import_compat()
                 from transformers import AwqConfig
                 options['quantization_config'] = AwqConfig(bits=4, group_size=128,
                     zero_point=True, version='gemm', backend='autoawq', do_fuse=False)

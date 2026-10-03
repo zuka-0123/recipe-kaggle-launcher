@@ -16,7 +16,8 @@ def main():
     # The usual worker must be terminal, even though this check has no D1 jobs.
     kernel_status(owner + '/' + slug)
     reference = owner + '/recipe-qwen-awq-preflight'
-    # Root verifies this dedicated new slug absent in the browser before first push.
+    # This dedicated preflight now exists; reject an active version too.
+    kernel_status(reference)
     code = '''import base64, gc, io, json, os, pathlib, shutil, subprocess, sys, tempfile, time, zipfile
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
