@@ -713,9 +713,10 @@ class Models:
 
 
 def enforce_evidence(candidate, evidence):
-    """Fix locations only from existing evidence, reject invented references."""
+    """Use existing evidence for locations and omitted references; reject invented IDs."""
     available = {item['ref_id']: item for item in evidence}
-    refs = candidate.get('source_refs', [])
+    refs = candidate.setdefault('source_refs', [])
+    listed = {ref['ref_id'] for ref in refs if isinstance(ref, dict) and isinstance(ref.get('ref_id'), str)} if isinstance(refs, list) else set()
     # Keep malformed model values for JSON Schema review; never hash or search them.
     for ref in refs if isinstance(refs, list) else []:
         if not isinstance(ref, dict) or not isinstance(ref.get('ref_id'), str):
@@ -732,8 +733,14 @@ def enforce_evidence(candidate, evidence):
             ref['text'] = None
     for section in ['ingredients', 'steps']:
         for item in candidate.get(section, []) if isinstance(candidate.get(section), list) else []:
-            if isinstance(item, dict) and isinstance(item.get('source_ref'), str) and item['source_ref'] not in available:
+            if not isinstance(item, dict) or not isinstance(item.get('source_ref'), str):
+                continue
+            ref_id = item['source_ref']
+            if ref_id not in available:
                 raise AppError('invalid_evidence', '原典にない根拠IDをAIが返しました。')
+            if isinstance(refs, list) and ref_id not in listed:
+                refs.append(copy.deepcopy(available[ref_id]))
+                listed.add(ref_id)
 
 
 def needs_more(candidate):

@@ -802,6 +802,29 @@ class WorkerTests(unittest.TestCase):
         with self.assertRaises(AppError):
             worker.enforce_evidence(candidate, evidence)
 
+    def test_missing_used_references_are_copied_from_original_once(self):
+        evidence = [
+            {'ref_id': 'src_001', 'type': 'youtube_description', 'text': '概要欄', 'start_seconds': None, 'end_seconds': None},
+            {'ref_id': 'src_028', 'type': 'youtube_transcript', 'text': '卵を2個使います', 'start_seconds': 54.572, 'end_seconds': 62.334},
+            {'ref_id': 'src_029', 'type': 'youtube_transcript', 'text': 'よく混ぜます', 'start_seconds': 62.334, 'end_seconds': 70},
+            {'ref_id': 'src_030', 'type': 'youtube_transcript', 'text': '使われていない根拠', 'start_seconds': 70, 'end_seconds': 75},
+        ]
+        for refs in [[], [copy.deepcopy(evidence[0])], None]:
+            candidate = {'ingredients': [{'source_ref': 'src_028', 'amount': {'value': 2}}],
+                'steps': [{'source_ref': 'src_029'}, {'source_ref': 'src_028'}]}
+            if refs is not None:
+                candidate['source_refs'] = refs
+            original_content = copy.deepcopy(candidate)
+            with self.subTest(initial_refs=refs):
+                worker.enforce_evidence(candidate, evidence)
+                worker.enforce_evidence(candidate, evidence)
+                self.assertEqual(candidate['source_refs'][-2:], evidence[1:3])
+                self.assertEqual(len(candidate['source_refs']), 2 + bool(refs and refs[0]['ref_id'] == 'src_001'))
+                self.assertEqual(candidate['ingredients'], original_content['ingredients'])
+                self.assertEqual(candidate['steps'], original_content['steps'])
+                candidate['source_refs'][-1]['text'] = None
+                self.assertEqual(evidence[2]['text'], 'よく混ぜます')
+
     def test_malformed_evidence_values_are_preserved_for_schema_review(self):
         evidence = [{'ref_id': 'src_001', 'type': 'text_span', 'text': '塩を少々入れる',
             'start_seconds': None, 'end_seconds': None}]

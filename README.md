@@ -14,7 +14,7 @@ YouTubeは概要欄と字幕から先に候補を作ります。料理名、材�
 
 LLM生成中はT4でefficient SDPAだけを使います。固定したTransformersのK/V展開経路を一時的に使い、GQAが大きなメモリを使うmath方式へ進むのを防ぎます。処理後は設定を戻します。対応しない環境では`model_api_incompatible`として停止します。原典の切り捨てや別GPUへの切り替えはありません。
 
-launcherのCPUテスト82件が合格しました。modelの取得と推論はmockしています。実際の無料T4では14BのロードとJSON生成を確認しました。MVPでは代表例の主要フローを確認し、性能ベンチマークやモデル選定の追加検証は行いません。原文にない人数・時間・火加減や字幕由来の分量誤り、根拠参照の不足が候補に残る場合があるため、人が確認・修正してから正式保存します。取得した原文と一致しない引用はnullにし、存在しない根拠IDは受け入れません。
+launcherのCPUテスト83件が合格しました。modelの取得と推論はmockしています。実際の無料T4では14BのロードとJSON生成を確認しました。MVPでは代表例の主要フローを確認し、性能ベンチマークやモデル選定の追加検証は行いません。原文にない人数・時間・火加減や、字幕と本文の食い違いが候補に残る場合があるため、人が確認・修正してから正式保存します。材料・手順が使う根拠IDの収録漏れは、取得済みの原文とtimestampから自動補完します。取得した原文と一致しない引用はnullにし、存在しない根拠IDは受け入れません。
 
 ASRはPyAV 18.1.0に固定しています。AWQは公式と同じ旧クラス名aliasでAutoAWQを読み込みます。自動起動の日次上限は変更していません。NotebookへのSecrets登録はKaggle CLIで対応していないため、短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
 
