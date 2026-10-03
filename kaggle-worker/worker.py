@@ -17,6 +17,7 @@ import time
 from types import SimpleNamespace
 import urllib.error
 import urllib.request
+import unicodedata
 import warnings
 from urllib.parse import urlsplit
 
@@ -266,6 +267,7 @@ source_refsは実際に使った根拠だけを参照し、textは必要な短�
 材料amountもobjectを保持し、value・unit・raw_textの3キーを必ず含めます。raw_textは読めた分量表現を数量・単位・語順ごと原文通り保存します。ほかの欄から原文を作り直しません。
 unitは提示したCanonical enumの値だけです。日本語の「大さじ」「小さじ」「個」「本」「少々」をunitへそのまま入れないでください。大さじはtbsp、小さじはtsp、個・本の個数はpieceへ表記統一できます。対応が判断できない単位はunit=null、raw_textに原文を残します。
 「少々」「適量」「ひとつまみ」「お好みで」等はamount.value=null、amount.unit=null、amount.raw_textに読めた原文を残してください。pinch等のenumにない単位や、推測した数値を返さないでください。
+「2～3個」「大さじ1～2」「25～30分」の範囲はraw_textへ原文通り保存し、value=nullにします。片端や平均を単一数値として返しません。原典の単位が明確ならunitは保持します。人数が「2～3人分」ならyield.quantity=null、unit="serving"、raw_text="2～3人分"です。「5分未満」のような上限・下限だけの表現も単一数値にせず、time.total_minutes=null、time.raw_textに原文を残します。
 heatは各工程の原文に火加減が明記される場合だけ設定します。未記載の工程はheat=nullです。前の工程の火加減を引き継がず、煮詰める等の動詞から推測しません。
 料理名や見出しの「2人分」等も原典の人数情報です。title.originalの原文を保持し、yield.quantity=2、unit="serving"、raw_text="2人分"のようにyieldにも記録してください。記載がなければyieldの各値はnullです。
 時間・温度もその工程で明記された値だけを記録します。「片面3分ずつ」を合計6分へ計算するなど、原典にない値を作らないでください。
@@ -690,6 +692,7 @@ class Models:
         candidate['user_corrections'] = []
         repair_literal_absence(candidate)
         complete_required_shape(candidate, self.schema)
+        preserve_non_single_quantities(candidate)
         enforce_evidence(candidate, extraction['evidence'])
         return candidate, raw[:MAX_OUTPUT_CHARS]
 
@@ -710,6 +713,33 @@ class Models:
         finally:
             del model
             gc.collect()
+
+
+def non_single_quantity(raw):
+    if not isinstance(raw, str):
+        return False
+    text = unicodedata.normalize('NFKC', raw)
+    number = r'\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?'
+    unit = r'(?:kg|mg|ml|g|l|tsp|tbsp|cups?|個|本|枚|人分|分|秒|時間|カップ)?'
+    return bool(re.search(number + r'\s*' + unit + r'\s*(?:[~〜～\-–－]|から)\s*' + number, text, re.I)
+        or re.search(number + r'\s*' + unit + r'\s*(?:以上|以下|未満|超)', text)
+        or re.search(r'\b(?:under|over|less than|more than)\s+' + number, text, re.I))
+
+
+def preserve_non_single_quantities(candidate):
+    """v1 keeps ranges/bounds verbatim; never choose an endpoint or average."""
+    for section, key in [('ingredients', 'amount'), ('steps', 'duration')]:
+        rows = candidate.get(section)
+        for item in rows if isinstance(rows, list) else []:
+            measure = item.get(key) if isinstance(item, dict) else None
+            if isinstance(measure, dict) and non_single_quantity(measure.get('raw_text')):
+                measure['value'] = None
+    quantity = candidate.get('yield')
+    if isinstance(quantity, dict) and non_single_quantity(quantity.get('raw_text')):
+        quantity['quantity'] = None
+    time_value = candidate.get('time')
+    if isinstance(time_value, dict) and time_value.get('prep_minutes') is None and time_value.get('cook_minutes') is None and non_single_quantity(time_value.get('raw_text')):
+        time_value['total_minutes'] = None
 
 
 def enforce_evidence(candidate, evidence):

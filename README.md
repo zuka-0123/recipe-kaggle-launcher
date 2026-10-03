@@ -14,10 +14,12 @@ YouTubeは概要欄と字幕から先に候補を作ります。料理名、材�
 
 LLM生成中はT4でefficient SDPAだけを使います。固定したTransformersのK/V展開経路を一時的に使い、GQAが大きなメモリを使うmath方式へ進むのを防ぎます。処理後は設定を戻します。対応しない環境では`model_api_incompatible`として停止します。原典の切り捨てや別GPUへの切り替えはありません。
 
-launcherのCPUテスト83件が合格しました。modelの取得と推論はmockしています。実際の無料T4では14BのロードとJSON生成を確認しました。MVPでは代表例の主要フローを確認し、性能ベンチマークやモデル選定の追加検証は行いません。原文にない人数・時間・火加減や、字幕と本文の食い違いが候補に残る場合があるため、人が確認・修正してから正式保存します。材料・手順が使う根拠IDの収録漏れは、取得済みの原文とtimestampから自動補完します。取得した原文と一致しない引用はnullにし、存在しない根拠IDは受け入れません。
+launcherのCPUテスト84件が合格しました。modelの取得と推論はmockしています。実際の無料T4では14BのロードとJSON生成を確認しました。MVPでは代表例の主要フローを確認し、性能ベンチマークやモデル選定の追加検証は行いません。原文にない人数・時間・火加減や、字幕と本文の食い違いが候補に残る場合があるため、人が確認・修正してから正式保存します。材料・手順が使う根拠IDの収録漏れは、取得済みの原文とtimestampから自動補完します。取得した原文と一致しない引用はnullにし、存在しない根拠IDは受け入れません。
 
 ASRはPyAV 18.1.0に固定しています。AWQは公式と同じ旧クラス名aliasでAutoAWQを読み込みます。自動起動の日次上限は変更していません。NotebookへのSecrets登録はKaggle CLIで対応していないため、短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
 
 14Bのgenerationは[公式の非Thinking設定](https://huggingface.co/Qwen/Qwen3-14B-AWQ)であるtemperature 0.7 / top_p 0.8 / top_k 20 / min_p 0をseed 42で使います。出力上限は6,144 token、生成上限は900秒（4,000 token以上のYouTubeは1,200秒）で、batchの残り時間も守ります。14Bのbatch上限は105分で、Notebookの110分上限とtokenの120分期限を守ります。生成されたthinkingタグは削って受け入れず、raw outputを保持したエラーとして確認対象にします。
 
 Colabで手動デバッグするときは同じworker codeを一時環境に置きます。自動起動や常駐機能はありません。
+
+範囲・上下限の分量や時間はraw_textに原文を残し、単一数値をnullにします。明確な単位は保持します。人数の範囲にも対応します。Canonical Recipe Schema v1は変更せず、下限・上限の専用数値フィールドは追加していません。

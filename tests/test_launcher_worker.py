@@ -802,6 +802,21 @@ class WorkerTests(unittest.TestCase):
         with self.assertRaises(AppError):
             worker.enforce_evidence(candidate, evidence)
 
+    def test_ranges_and_bounds_keep_original_text_without_single_values(self):
+        for raw in ['2～3個', '２〜３個', '大さじ1～2', '200g〜300g', '1/2～1個', '2から3個', '2-3 chopped tarragon leaves', '5分未満', '5分以下', '5分以上', 'Ready in under 5 mins']:
+            candidate = {'ingredients': [{'amount': {'value': 2, 'unit': 'piece', 'raw_text': raw}}],
+                'steps': [{'duration': {'value': 25, 'unit': 'minute', 'raw_text': '25～30分'}}],
+                'yield': {'quantity': 2, 'unit': 'serving', 'raw_text': '2～3人分'},
+                'time': {'prep_minutes': None, 'cook_minutes': None, 'total_minutes': 5, 'raw_text': '5分未満'}}
+            with self.subTest(raw=raw):
+                worker.preserve_non_single_quantities(candidate)
+                self.assertEqual(candidate['ingredients'][0]['amount'], {'value': None, 'unit': 'piece', 'raw_text': raw})
+                self.assertIsNone(candidate['steps'][0]['duration']['value'])
+                self.assertIsNone(candidate['yield']['quantity'])
+                self.assertIsNone(candidate['time']['total_minutes'])
+        for raw in ['2個', '1/2個', '大さじ1と1/2', '25分ほど']:
+            self.assertFalse(worker.non_single_quantity(raw))
+
     def test_missing_used_references_are_copied_from_original_once(self):
         evidence = [
             {'ref_id': 'src_001', 'type': 'youtube_description', 'text': '概要欄', 'start_seconds': None, 'end_seconds': None},
