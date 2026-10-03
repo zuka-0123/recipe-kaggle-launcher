@@ -728,7 +728,8 @@ def enforce_evidence(candidate, evidence):
         for key in ['type', 'start_seconds', 'end_seconds']:
             ref[key] = original[key]
         if ref.get('text') and isinstance(original.get('text'), str) and original['text'] and ref['text'] not in original['text']:
-            raise AppError('invalid_evidence', 'AIの引用が原典と一致しません。')
+            # An unverified quote is unknown; retain the candidate for human review.
+            ref['text'] = None
     for section in ['ingredients', 'steps']:
         for item in candidate.get(section, []) if isinstance(candidate.get(section), list) else []:
             if isinstance(item, dict) and isinstance(item.get('source_ref'), str) and item['source_ref'] not in available:

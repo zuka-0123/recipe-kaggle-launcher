@@ -793,8 +793,11 @@ class WorkerTests(unittest.TestCase):
         worker.enforce_evidence(candidate, evidence)
         self.assertEqual(candidate['source_refs'][0]['start_seconds'], 5)
         candidate['source_refs'][0]['text'] = '砂糖を100g入れる'
-        with self.assertRaises(AppError):
-            worker.enforce_evidence(candidate, evidence)
+        worker.enforce_evidence(candidate, evidence)
+        self.assertIsNone(candidate['source_refs'][0]['text'])
+        self.assertEqual(candidate['source_refs'][0]['start_seconds'], 5)
+        self.assertEqual(candidate['source_refs'][0]['end_seconds'], 8)
+        self.assertEqual(candidate['ingredients'], [{'source_ref': 'src_001'}])
         candidate['source_refs'][0]['ref_id'] = 'invented'
         with self.assertRaises(AppError):
             worker.enforce_evidence(candidate, evidence)
@@ -828,8 +831,7 @@ class WorkerTests(unittest.TestCase):
             'start_seconds': None, 'end_seconds': None}]
         cases = [{'source_refs': [{'ref_id': {}, 'text': []}, {'ref_id': 'unknown'}]},
             {'source_refs': {}, 'ingredients': [{'source_ref': []}, {'source_ref': 'unknown'}]},
-            {'source_refs': [], 'steps': [{'source_ref': {}}, {'source_ref': 'unknown'}]},
-            {'source_refs': [{'ref_id': 'src_001', 'text': '砂糖を100g'}]}]
+            {'source_refs': [], 'steps': [{'source_ref': {}}, {'source_ref': 'unknown'}]}]
         for candidate in cases:
             with self.subTest(candidate=candidate), self.assertRaises(AppError) as error:
                 worker.enforce_evidence(candidate, evidence)
