@@ -1,4 +1,5 @@
 import json
+import re
 
 import trafilatura
 from bs4 import BeautifulSoup
@@ -51,6 +52,12 @@ def parse_web(html, max_chars, recipe_index=0):
         if not body:
             main = soup.find('main') or soup.find('article')
             body = main.get_text('\n', strip=True) if main else None
+        if selected and not selected.get('recipeYield'):
+            # 本文抽出器が短い人数表示だけを落とす場合も、原文のまま資料へ残します。
+            for element in soup.find_all(['p', 'span']):
+                text = element.get_text(' ', strip=True)
+                if re.fullmatch(r'[（(]?\s*\d+(?:\.\d+)?(?:\s*[〜～~\-]\s*\d+(?:\.\d+)?)?\s*人分\s*[）)]?', text) and text not in (body or ''):
+                    body = (body or '') + '\n' + text
         if body:
             items.append(evidence(f'src_{len(items)+1:03d}', 'web_text', body))
     if not items:
