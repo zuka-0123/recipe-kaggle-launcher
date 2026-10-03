@@ -1,5 +1,6 @@
 import json
 import re
+from urllib.parse import urljoin
 
 import trafilatura
 from bs4 import BeautifulSoup
@@ -22,7 +23,7 @@ def recipes_in(value):
             if isinstance(child, (dict, list)):
                 yield from recipes_in(child)
 
-def parse_web(html, max_chars, recipe_index=0):
+def parse_web(html, max_chars, recipe_index=0, base_url=None):
     soup = BeautifulSoup(html, 'html.parser')
     recipes, warnings = [], []
     for script in soup.find_all('script', attrs={'type': 'application/ld+json'}):
@@ -39,6 +40,39 @@ def parse_web(html, max_chars, recipe_index=0):
         selected = recipes[recipe_index]
         if len(recipes) > 1:
             warnings.append(f'ページ内に{len(recipes)}件のRecipeがあります。{recipe_index + 1}件目を選びました。必要なら入力欄の番号を変更してください。')
+    image_urls = []
+    def add_image(value):
+        if isinstance(value, list):
+            for item in value:
+                add_image(item)
+        elif isinstance(value, dict):
+            add_image(value.get('contentUrl') or value.get('url'))
+        elif isinstance(value, str) and base_url:
+            url = urljoin(base_url, value)
+            if url.startswith(('https://', 'http://')) and url not in image_urls:
+                image_urls.append(url)
+    def step_images(value):
+        if isinstance(value, list):
+            for step in value:
+                step_images(step)
+        elif isinstance(value, dict):
+            add_image(value.get('image'))
+            step_images(value.get('itemListElement'))
+    if selected:
+        add_image(selected.get('image'))
+        step_images(selected.get('recipeInstructions'))
+    else:
+        for element in soup.select('nav, aside, footer, header, form, [role="navigation"], [role="complementary"], .advertisement, .ads, .related'):
+            element.decompose()
+        main = soup.find('article') or soup.find('main')
+        if main:
+            for image in main.find_all('img'):
+                try:
+                    if int(image.get('width', '400')) < 200 or int(image.get('height', '300')) < 120:
+                        continue
+                except ValueError:
+                    pass
+                add_image(image.get('data-src') or image.get('src'))
     items = []
     if selected:
         items.append(evidence('src_001', 'web_structured_data', json.dumps(selected, ensure_ascii=False)))
@@ -72,9 +106,9 @@ def parse_web(html, max_chars, recipe_index=0):
         author = author[0] if author else None
     if isinstance(author, dict):
         author = author.get('name')
-    return {'evidence': items, 'warnings': warnings, 'images': [],
+    return {'attachment_urls': image_urls[:4], 'evidence': items, 'warnings': warnings, 'images': [],
             'title': title if isinstance(title, str) else None,
             'creator': author if isinstance(author, str) else None}
 
 def extract_web(url, settings, recipe_index=0):
-    return parse_web(fetch_html(url), settings.max_input_chars, recipe_index)
+    return parse_web(fetch_html(url), settings.max_input_chars, recipe_index, url)

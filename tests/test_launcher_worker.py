@@ -1205,5 +1205,24 @@ class WorkerTests(unittest.TestCase):
             audio.assert_not_called()
 
 
+class AttachmentTests(unittest.TestCase):
+    def test_automatic_frames_are_bounded_and_prefer_recipe_evidence(self):
+        chosen = worker.automatic_image_seconds({'duration': 600}, {'source_refs': [{'start_seconds': 42}, {'start_seconds': 43}, {'start_seconds': 200}]}, 2700)
+        self.assertEqual(chosen[:2], [42, 200])
+        self.assertLessEqual(len(chosen), 4)
+        self.assertTrue(all(0 <= second < 600 for second in chosen))
+        self.assertEqual(worker.automatic_image_seconds({'duration': None}, {}, 2700), [])
+    def test_web_images_do_not_include_advertisement_or_other_recipe(self):
+        from workerlib.extractors.web import parse_web
+        html = '<article><div class="ads"><img src="/ad.jpg"></div><img src="/recipe.jpg"><p>鶏肉を焼きます。塩は少々。</p></article>'
+        result = parse_web(html, 120000, base_url='https://example.com/r')
+        self.assertEqual(result['attachment_urls'], ['https://example.com/recipe.jpg'])
+    def test_failed_video_capture_keeps_recipe_available(self):
+        from workerlib.extractors import youtube
+        with tempfile.TemporaryDirectory() as temporary, patch.object(youtube, 'frames', side_effect=AppError('frame_failed', '取得失敗')):
+            result = worker.save_video_images({'job_id': 'job_'+'a'*32, 'input': {'image_mode':'auto'}}, {'duration':600,'video_url':'https://www.youtube.com/watch?v=abcdefghijk','images':[]}, {}, Mock(), worker.settings_from({}, Path(temporary)), Path(temporary), Path(temporary))
+        self.assertEqual(len(result), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

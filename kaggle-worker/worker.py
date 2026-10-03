@@ -192,6 +192,27 @@ class BatchAPI:
         if not 0 < self.expires - time.time() <= 7200:
             raise AppError('worker_token_expired', 'batch tokenの期限が切れています。')
 
+    def upload_attachment(self, job_id, path, metadata):
+        if time.time() >= self.expires:
+            raise AppError('worker_token_expired', 'batch tokenの期限が切れています。')
+        data = Path(path).read_bytes()
+        if len(data) > MAX_IMAGE_BYTES:
+            raise AppError('input_too_large', '画像が上限を超えています。')
+        boundary = 'recipe-image-boundary'
+        body = (('--' + boundary + '\r\nContent-Disposition: form-data; name="metadata"\r\n\r\n').encode()
+            + json.dumps(metadata, ensure_ascii=False, allow_nan=False).encode()
+            + ('\r\n--' + boundary + '\r\nContent-Disposition: form-data; name="image"; filename="video-frame.jpg"\r\nContent-Type: image/jpeg\r\n\r\n').encode()
+            + data + ('\r\n--' + boundary + '--\r\n').encode())
+        request = urllib.request.Request(self.url + '/attachments/' + valid_id(job_id), data=body,
+            headers={'Authorization': 'Bearer ' + self.token,
+                'Content-Type': 'multipart/form-data; boundary=' + boundary,
+                'User-Agent': 'PersonalRecipeKB-worker/1.0'})
+        try:
+            with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
+                return json.loads(response.read(16384))
+        except (urllib.error.URLError, ValueError):
+            raise AppError('image_upload_failed', '画像をDriveへ保存できませんでした。', 502) from None
+
     def request(self, suffix='', payload=None, binary=False):
         stage = {'': 'api_get', '/start': 'api_start', '/results': 'api_results',
             '/finish': 'api_finish'}.get(suffix, 'api_input' if suffix.startswith('/inputs/') else 'api_request')
@@ -866,6 +887,47 @@ def safe_job_diagnostic(stage, error):
         + ' last_frame=' + job_failure_frame(error), flush=True)
 
 
+def automatic_image_seconds(extraction, candidate, maximum):
+    duration = extraction.get('duration')
+    if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(duration) or duration <= 0 or duration > maximum:
+        return []
+    times = []
+    def add(value):
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and 0 <= value < duration and all(abs(value-t) >= 8 for t in times):
+            times.append(round(value, 2))
+    # 根拠の時刻を優先。該当箇所がなければ序盤・中盤・終盤の候補を少数保存します。
+    for ref in (candidate or {}).get('source_refs', []):
+        add(ref.get('start_seconds'))
+        if len(times) >= 3:
+            break
+    for ratio in [0.1, 0.5, 0.9]:
+        if len(times) < 4:
+            add(duration * ratio)
+    return times[:4]
+
+
+def save_video_images(job, extraction, candidate, api, settings, directory, root):
+    from workerlib.extractors.youtube import frames
+    requested = frame_seconds(job.get('input', {}).get('frame_seconds'), settings.max_video_seconds)
+    if not requested and job.get('input', {}).get('image_mode', 'auto') == 'auto':
+        requested = automatic_image_seconds(extraction, candidate, settings.max_video_seconds)
+    if not requested:
+        return ['動画の画像を選べませんでした。必要なら秒数を指定するか画像を追加してください。']
+    try:
+        existing = {image.get('second'): image for image in extraction.get('images', [])}
+        images = [existing[t] for t in requested if t in existing]
+        missing = [t for t in requested if t not in existing]
+        if missing:
+            images += frames(extraction['video_url'], missing, directory / 'attachments', settings)
+        for image in images:
+            api.upload_attachment(job['job_id'], root / image['path'],
+                {'source_url': extraction['video_url'], 'source_id': extraction.get('source_id'),
+                 'timestamp_seconds': image['second']})
+        return []
+    except Exception:
+        return ['動画キャプチャの取得・保存に失敗しました。レシピは確認できます。必要なら画像を追加してください。']
+
+
 def process_job(job, api, models, settings, root):
     directory = root / ('job-' + valid_id(job['job_id']))
     directory.mkdir(exist_ok=True)
@@ -878,6 +940,11 @@ def process_job(job, api, models, settings, root):
         from workerlib.extractors.youtube import extract_youtube, download_audio, frames
         from workerlib.extractors.common import evidence
         kind = job['input_type']
+        if job.get('input', {}).get('media_only'):
+            extraction = extract_youtube(value, settings)
+            notices = save_video_images(job, extraction, template, api, settings, directory, root)
+            return {'job_id': job['job_id'], 'warnings': notices}
+
         if kind == 'text':
             extraction = extract_text(value, settings.max_input_chars)
         elif kind == 'web':
@@ -941,7 +1008,17 @@ def process_job(job, api, models, settings, root):
         errors = list(Draft202012Validator(models.schema, format_checker=FormatChecker()).iter_errors(candidate))
         result = {'job_id': job['job_id'], 'candidate': candidate,
             'evidence': extraction['evidence'], 'raw_output': raw}
-        # Keep API payload within the common result contract; cloud reports validation errors.
+        notices = []
+        if job.get('input', {}).get('image_mode', 'none') != 'none':
+            if kind == 'youtube':
+                notices = save_video_images(job, extraction, candidate, api, settings, directory, root)
+            elif kind == 'web':
+                for url in extraction.get('attachment_urls', [])[:4]:
+                    try:
+                        api.request('/attachments/' + valid_id(job['job_id']), {'url': url})
+                    except Exception:
+                        notices.append('掲載画像を取得できませんでした。必要なら画像を追加してください。')
+        result['warnings'] = list(dict.fromkeys(notices))
         return result
     except Exception as error:
         safe_job_diagnostic(stage, error)
