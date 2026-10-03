@@ -1,5 +1,6 @@
 """CPU-only contract tests. Models, network and Kaggle submission are mocked."""
 import datetime as dt
+import copy
 from contextlib import contextmanager, redirect_stdout
 import enum
 import importlib.util
@@ -204,7 +205,7 @@ class WorkerTests(unittest.TestCase):
             worker.safe_runtime_diagnostic(modules['torch'], 'private-token')
         self.assertEqual(output.getvalue().strip(), 'recipe_runtime torch=unknown capability=unknown input_tokens=1')
 
-    def test_efficient_context_applies_only_to_llm_generate(self):
+    def test_generation_context_and_youtube_time_limit_respect_deadline(self):
         class Inputs(dict):
             def to(self, device): return self
         class Output:
@@ -222,19 +223,26 @@ class WorkerTests(unittest.TestCase):
             @property
             def tokenizer(self): return self
             def apply_chat_template(self, *args, **kwargs): return 'mock input'
-            def __call__(self, *args, **kwargs): return Inputs(input_ids=types.SimpleNamespace(shape=(1, 5)))
+            def __call__(self, *args, **kwargs): return Inputs(input_ids=types.SimpleNamespace(shape=(1, token_count)))
             def decode(self, *args, **kwargs): return '{"title":{"original":"料理"},"ingredients":[],"steps":[]}'
-        for images in [[], [{'path': 'unused.jpg', 'ref_id': 'src_001'}]]:
-            with self.subTest(images=bool(images)):
-                models = worker.Models({}, {}, 'rules', Path('.'), worker.time.time() + 1000)
-                models.model = types.SimpleNamespace(generate=lambda **kwargs: Output())
+        cases = [('youtube', 3999, 1000, [], 360), ('youtube', 4000, 1000, [], 600),
+            ('youtube', 6746, 500, [], 480), ('web', 6746, 1000, [], 360),
+            ('text', 4000, 1000, [], 360), ('image', 4996, 1000,
+                [{'path': 'unused.jpg', 'ref_id': 'src_001'}], 360)]
+        for source_type, token_count, remaining, images, expected_seconds in cases:
+            with self.subTest(source=source_type, tokens=token_count, remaining=remaining):
+                models = worker.Models({}, {}, 'rules', Path('.'), 1000 + remaining)
+                generate = Mock(return_value=Output())
+                models.model = types.SimpleNamespace(generate=generate)
                 models.processor = Processor()
                 template = {key: 'fixed' for key in ['recipe_id', 'schema_version', 'created_at', 'updated_at']}
-                template['source'] = {}
+                template['source'] = {'type': source_type}
                 before = len(entries)
-                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), redirect_stdout(io.StringIO()):
+                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), patch.object(worker.time, 'time', return_value=1000), redirect_stdout(io.StringIO()):
                     models.structure({'images': images, 'evidence': []}, template)
                 self.assertEqual(len(entries) - before, 0 if images else 1)
+                self.assertEqual(generate.call_args.kwargs['max_time'], expected_seconds)
+                self.assertEqual(generate.call_args.kwargs['max_new_tokens'], 6144)
 
     def fake_model_modules(self):
         torch = types.SimpleNamespace(float16='mock-fp16', cuda=types.SimpleNamespace(
@@ -577,6 +585,64 @@ class WorkerTests(unittest.TestCase):
         candidate['source_refs'][0]['ref_id'] = 'invented'
         with self.assertRaises(AppError):
             worker.enforce_evidence(candidate, evidence)
+
+    def test_malformed_evidence_values_are_preserved_for_schema_review(self):
+        evidence = [{'ref_id': 'src_001', 'type': 'text_span', 'text': '塩を少々入れる',
+            'start_seconds': None, 'end_seconds': None}]
+        for invalid in [{'private': 'value'}, ['src_001'], 1, None]:
+            for field in ['ref_id', 'text']:
+                ref = {'ref_id': 'src_001', 'text': '塩を少々', 'type': 'unchanged',
+                    'start_seconds': 99, 'end_seconds': 100}
+                ref[field] = invalid
+                candidate = {'source_refs': [ref], 'ingredients': [{'source_ref': invalid}],
+                    'steps': [{'source_ref': invalid}]}
+                # null text is a valid unknown quote; malformed values must not be rewritten.
+                if field == 'text' and invalid is None:
+                    continue
+                before = copy.deepcopy(candidate)
+                with self.subTest(field=field, value=invalid):
+                    worker.enforce_evidence(candidate, evidence)
+                    self.assertEqual(candidate, before)
+        for invalid in [{'ref_id': 'src_001'}, 'src_001', None, 1]:
+            candidate = {'source_refs': invalid, 'ingredients': [], 'steps': []}
+            before = copy.deepcopy(candidate)
+            with self.subTest(source_refs=invalid):
+                worker.enforce_evidence(candidate, evidence)
+                self.assertEqual(candidate, before)
+
+    def test_malformed_reference_does_not_hide_unknown_string_reference(self):
+        evidence = [{'ref_id': 'src_001', 'type': 'text_span', 'text': '塩を少々',
+            'start_seconds': None, 'end_seconds': None}]
+        cases = [{'source_refs': [{'ref_id': {}, 'text': []}, {'ref_id': 'unknown'}]},
+            {'source_refs': {}, 'ingredients': [{'source_ref': []}, {'source_ref': 'unknown'}]},
+            {'source_refs': [], 'steps': [{'source_ref': {}}, {'source_ref': 'unknown'}]},
+            {'source_refs': [{'ref_id': 'src_001', 'text': '砂糖を100g'}]}]
+        for candidate in cases:
+            with self.subTest(candidate=candidate), self.assertRaises(AppError) as error:
+                worker.enforce_evidence(candidate, evidence)
+            self.assertEqual(error.exception.code, 'invalid_evidence')
+
+    @unittest.skipUnless((ROOT.parent / 'canonical.schema.json').exists() and importlib.util.find_spec('jsonschema'), 'Canonical Schema and validator are required')
+    def test_malformed_references_reach_review_but_fail_canonical_validation(self):
+        from jsonschema import Draft202012Validator
+        schema = json.loads((ROOT.parent / 'canonical.schema.json').read_text(encoding='utf-8'))
+        evidence = [{'ref_id': 'src_001', 'type': 'text_span', 'text': '塩を少々',
+            'start_seconds': None, 'end_seconds': None}]
+        candidate = {'title': {'original': '料理'}, 'ingredients': [
+                {'name': {'raw': '塩'}, 'source_ref': {'ref_id': 'src_001'}}],
+            'steps': [{'instruction': '塩を少々', 'source_ref': ['src_001']}],
+            'source_refs': [{'ref_id': {'id': 'src_001'}, 'text': '塩'},
+                {'ref_id': 'src_001', 'text': {'quote': '塩'}}]}
+        raw = json.dumps(candidate, ensure_ascii=False)
+        worker.complete_required_shape(candidate, schema)
+        before = copy.deepcopy(candidate)
+        worker.enforce_evidence(candidate, evidence)
+        self.assertEqual(candidate, before)
+        paths = {tuple(error.path) for error in Draft202012Validator(schema).iter_errors(candidate)}
+        for path in [('ingredients', 0, 'source_ref'), ('steps', 0, 'source_ref'),
+                ('source_refs', 0, 'ref_id'), ('source_refs', 1, 'text')]:
+            self.assertIn(path, paths)
+        self.assertEqual(json.loads(raw)['source_refs'][1]['text'], {'quote': '塩'})
 
     def test_unknown_models_cannot_be_external_endpoints(self):
         with self.assertRaises(AppError):

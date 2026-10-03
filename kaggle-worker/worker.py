@@ -257,6 +257,7 @@ title.original、name.raw、raw_text、instruction、引用は原典の言語・
 preparationは材料欄に明示された前処理だけをstringで記録し、未記載はnullです。配列やobjectにせず、手順から移しません。
 ingredient_refsはこの回答のingredientsに存在するingredient_id文字列だけの配列です。材料名を参照IDにせず、不明なら[]です。
 ingredient_idは空文字にせず、材料の順にing_001、ing_002のような重複しないIDを付けます。これは管理用IDであり、原典の料理情報ではありません。
+source_refsは実際に使った根拠だけを参照し、textは必要な短い原文引用だけにします。入力の字幕全文や根拠資料の配列をコピーしません。
 各stepのdurationとtemperatureは必ず{"value":null,"unit":null,"raw_text":null}形式のobjectを保持します。不明だからといってobject全体をnullにしないでください。
 材料amountもobjectを保持し、value・unit・raw_textの3キーを必ず含めます。raw_textは読めた分量表現を数量・単位・語順ごと原文通り保存します。ほかの欄から原文を作り直しません。
 unitは提示したCanonical enumの値だけです。日本語の「大さじ」「小さじ」「個」「本」「少々」をunitへそのまま入れないでください。大さじはtbsp、小さじはtsp、個・本の個数はpieceへ表記統一できます。対応が判断できない単位はunit=null、raw_textに原文を残します。
@@ -568,9 +569,10 @@ class Models:
         if remaining < 30:
             raise BatchTimeout()
         safe_runtime_diagnostic(torch, tokens)
+        generation_seconds = 600 if template.get('source', {}).get('type') == 'youtube' and tokens >= 4000 else 360
         with torch.inference_mode(), (nullcontext() if images else t4_efficient_sdpa()):
             output = self.model.generate(**inputs, max_new_tokens=6144, do_sample=False,
-                max_time=min(360, remaining - 20))
+                max_time=min(generation_seconds, remaining - 20))
         generated = output[0, tokens:]
         safe_runtime_diagnostic(torch, tokens, generated.shape[-1])
         decoder = self.processor.tokenizer if images else self.processor
@@ -609,19 +611,22 @@ def enforce_evidence(candidate, evidence):
     """Fix locations only from existing evidence, reject invented references."""
     available = {item['ref_id']: item for item in evidence}
     refs = candidate.get('source_refs', [])
-    if not isinstance(refs, list):
-        raise AppError('invalid_evidence', 'AIが返した根拠の形式が不正です。')
-    for ref in refs:
-        if not isinstance(ref, dict) or ref.get('ref_id') not in available:
+    # Keep malformed model values for JSON Schema review; never hash or search them.
+    for ref in refs if isinstance(refs, list) else []:
+        if not isinstance(ref, dict) or not isinstance(ref.get('ref_id'), str):
+            continue
+        if ref['ref_id'] not in available:
             raise AppError('invalid_evidence', '原典にない根拠IDをAIが返しました。')
+        if ref.get('text') is not None and not isinstance(ref['text'], str):
+            continue
         original = available[ref['ref_id']]
         for key in ['type', 'start_seconds', 'end_seconds']:
             ref[key] = original[key]
-        if ref.get('text') and original.get('text') and ref['text'] not in original['text']:
+        if ref.get('text') and isinstance(original.get('text'), str) and original['text'] and ref['text'] not in original['text']:
             raise AppError('invalid_evidence', 'AIの引用が原典と一致しません。')
     for section in ['ingredients', 'steps']:
         for item in candidate.get(section, []) if isinstance(candidate.get(section), list) else []:
-            if isinstance(item, dict) and item.get('source_ref') is not None and item['source_ref'] not in available:
+            if isinstance(item, dict) and isinstance(item.get('source_ref'), str) and item['source_ref'] not in available:
                 raise AppError('invalid_evidence', '原典にない根拠IDをAIが返しました。')
 
 
