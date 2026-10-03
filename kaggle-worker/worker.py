@@ -652,7 +652,7 @@ class Models:
             raise BatchTimeout()
         safe_runtime_diagnostic(torch, tokens)
         long_youtube = template.get('source', {}).get('type') == 'youtube' and tokens >= 4000
-        generation_seconds = (900 if long_youtube else 600) if awq else (600 if long_youtube else 360)
+        generation_seconds = (1200 if long_youtube else 900) if awq else (600 if long_youtube else 360)
         sampling = {'do_sample': True, 'temperature': 0.7, 'top_p': 0.8,
             'top_k': 20, 'min_p': 0.0} if awq else {'do_sample': False}
         if awq:
@@ -935,7 +935,8 @@ def run(config, root):
         raise AppError('invalid_batch', 'batch件数が不正です。')
     api.request('/start', {})
     settings = settings_from(batch['config'], root)
-    maximum = min(int(batch['config'].get('max_batch_seconds', 5400)), 5400)
+    batch_cap = 6300 if model_name(batch['config'].get('llm_model'), QWEN3_AWQ_MODEL) == QWEN3_AWQ_MODEL else 5400
+    maximum = min(int(batch['config'].get('max_batch_seconds', 5400)), batch_cap)
     # Leave time for bounded HTTP retries and the final result/finish callbacks.
     deadline = min(time.time() + maximum, api.expires - 180)
     rules = batch.get('extraction_prompt')

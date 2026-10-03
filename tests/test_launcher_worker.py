@@ -244,9 +244,11 @@ class WorkerTests(unittest.TestCase):
             (worker.NF4_MODEL, 'text', 24000, 1000, [], 360),
             (worker.QWEN3_AWQ_MODEL, 'image', 4996, 1000,
                 [{'path': 'unused.jpg', 'ref_id': 'src_001'}], 360),
-            (worker.QWEN3_AWQ_MODEL, 'text', 12000, 1000, [], 600),
-            (worker.QWEN3_AWQ_MODEL, 'youtube', 3999, 1000, [], 600),
-            (worker.QWEN3_AWQ_MODEL, 'youtube', 4000, 1000, [], 900),
+            (worker.QWEN3_AWQ_MODEL, 'text', 12000, 1000, [], 900),
+            (worker.QWEN3_AWQ_MODEL, 'text', 2379, 500, [], 480),
+            (worker.QWEN3_AWQ_MODEL, 'youtube', 3999, 1000, [], 900),
+            (worker.QWEN3_AWQ_MODEL, 'youtube', 4000, 1500, [], 1200),
+            (worker.QWEN3_AWQ_MODEL, 'youtube', 4000, 1000, [], 980),
             (worker.QWEN3_AWQ_MODEL, 'youtube', 6746, 700, [], 680),
             (worker.QWEN3_AWQ_MODEL, 'text', 12001, 1000, [], None),
             (worker.NF4_MODEL, 'text', 24001, 1000, [], None)]
@@ -843,14 +845,21 @@ class WorkerTests(unittest.TestCase):
 
     def test_runtime_reserves_three_minutes_before_token_expiry(self):
         class FakeAPI:
-            expires = __import__('time').time() + 1000
+            expires = 2000
             def __init__(self, config): pass
             def request(self, suffix='', payload=None):
                 return {'batch_id': 'batch-1', 'jobs': [], 'schema': {},
-                    'config': {'max_batch_seconds': 3600}, 'extraction_prompt': 'rules'} if suffix == '' else {}
-        with tempfile.TemporaryDirectory() as temporary, patch.object(worker, 'BatchAPI', FakeAPI), patch.object(worker, 'Models') as models, patch.object(worker, 'check_gpu', side_effect=AppError('gpu_unavailable', 'GPUなし')):
-            worker.run(claim(), Path(temporary))
-        self.assertEqual(models.call_args.args[-1], FakeAPI.expires - 180)
+                    'config': batch_config, 'extraction_prompt': 'rules'} if suffix == '' else {}
+        cases = [({'max_batch_seconds': 3600}, 2000, 1820),
+            ({'llm_model': worker.QWEN3_AWQ_MODEL, 'max_batch_seconds': 6600}, 9000, 7300),
+            ({'llm_model': worker.QWEN3_AWQ_MODEL, 'max_batch_seconds': 3600}, 9000, 4600),
+            ({'llm_model': worker.NF4_MODEL, 'max_batch_seconds': 6600}, 9000, 6400),
+            ({'llm_model': worker.NF4_MODEL, 'max_batch_seconds': 3600}, 9000, 4600)]
+        for batch_config, expiry, expected_deadline in cases:
+            FakeAPI.expires = expiry
+            with self.subTest(config=batch_config, expiry=expiry), tempfile.TemporaryDirectory() as temporary, patch.object(worker, 'BatchAPI', FakeAPI), patch.object(worker, 'Models') as models, patch.object(worker.time, 'time', return_value=1000), patch.object(worker, 'check_gpu', side_effect=AppError('gpu_unavailable', 'GPUなし')):
+                worker.run(claim(), Path(temporary))
+            self.assertEqual(models.call_args.args[-1], expected_deadline)
 
     def test_invalid_candidate_title_does_not_crash_fallback_decision(self):
         self.assertTrue(worker.needs_more({'title': 'wrong type', 'ingredients': [{}], 'steps': [{}]}))

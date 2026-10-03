@@ -16,7 +16,7 @@ LLM生成中はT4でefficient SDPAだけを使います。固定したTransforme
 
 `python -m unittest discover -s tests -v`で70件すべて合格しました。テストではmodelの取得と推論をmockしています。7BのNF4とefficient SDPAは実際のKaggle T4で動き、text 2件とimage 1件がSchemaに適合した候補を返しました。原文・単位・火加減の誤りは人の確認が必要です。候補の不正な参照型は保持してSchemaレビューへ渡し、4,000 token以上のYouTubeだけ生成上限を600秒とします。残り時間と6144 tokenの出力上限は維持します。追加修正を含む実レシピ比較を検証中です。自動起動の日次上限は変更していません。YouTubeのASR互換性エラーはPyAV 18.1.0の固定で無料CPU環境において解消しました。14Bの最初のGPUロードはAutoAWQの旧クラス名importで停止しました。公式と同じクラス名aliasを反映後、無料T4でロード（約9.3GiB）と9,145 tokenのJSON生成（ピーク約12.0GiB）を確認しました。AWQ Tritonの小行列を公式dequant+matmulと比較して合格し、128 tokenを45.2秒で生成しました。CPU全面offloadや有料fallbackは使いません。実レシピの品質比較と確認待ちへの遷移を検証中です。NotebookへのSecrets登録はKaggle CLIで対応していないため、今回の短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
 
-14Bのgenerationは公式の非Thinking設定temperature 0.7 / top_p 0.8 / top_k 20 / min_p 0をseed 42で使います。出力上限は6,144 token、生成上限は600秒（4,000 token以上のYouTubeは900秒）で、batchの残り時間も守ります。生成されたthinkingタグは削って受け入れず、raw outputを保持したエラーとして確認対象にします。
+14Bのgenerationは公式の非Thinking設定temperature 0.7 / top_p 0.8 / top_k 20 / min_p 0をseed 42で使います。出力上限は6,144 token、生成上限は900秒（4,000 token以上のYouTubeは1,200秒）で、batchの残り時間も守ります。実レシピの1,327 token生成に569.2秒かかったため、600秒固定から延ばしました。14Bのbatch上限は105分で、Notebookの110分上限とtokenの120分期限を守ります。生成されたthinkingタグは削って受け入れず、raw outputを保持したエラーとして確認対象にします。
 
 Colabで手動デバッグするときは同じworker codeを一時環境に置きます。自動起動や常駐機能はありません。
 
