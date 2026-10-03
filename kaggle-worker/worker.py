@@ -157,6 +157,9 @@ def bootstrap(config, root):
 
 def parse_json(raw):
     text = raw.strip()
+    if re.search(r'</?think\b[^>]*>', text, re.I):
+        raise AppError('llm_not_json', 'AI出力にthinkingタグが含まれています。', 422,
+            {'raw_output': raw[:MAX_OUTPUT_CHARS]})
     if text.startswith('```') and text.endswith('```'):
         text = '\n'.join(text.splitlines()[1:-1])
     try:
@@ -492,12 +495,58 @@ def safe_runtime_diagnostic(torch, input_tokens, output_tokens=None):
         + ' input_tokens=' + str(input_tokens) + output_label, flush=True)
 
 
+QWEN3_AWQ_MODEL = 'Qwen/Qwen3-14B-AWQ'
+NF4_MODEL = 'Qwen/Qwen2.5-7B-Instruct'
+AWQ_SAMPLING_SEED = 42
+
+
+@contextmanager
+def awq_gpu_dequant():
+    """Select AutoAWQ's GPU torch dequant+matmul path, never external kernels."""
+    try:
+        import importlib
+        gemm = importlib.import_module('awq.modules.linear.gemm')
+        if not callable(gemm.dequantize_gemm):
+            raise AttributeError()
+        original = (gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned)
+    except Exception:
+        raise AppError('model_api_incompatible', '無料GPUのAWQ解析方式に対応していません。', 503) from None
+    try:
+        gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = None, False, True
+        yield
+    finally:
+        gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = original
+
+
+def safe_gpu_diagnostic(torch, stage, elapsed):
+    """Only fixed stages and bounded numbers, including on failed load/generation."""
+    if stage not in {'load', 'generate'}:
+        return
+    fields = []
+    if type(elapsed) in (int, float) and math.isfinite(elapsed) and 0 <= elapsed <= 7200:
+        fields.append('seconds=' + str(round(elapsed, 3)))
+    metrics = [('allocated', lambda: torch.cuda.memory_allocated(0)),
+        ('reserved', lambda: torch.cuda.memory_reserved(0)),
+        ('peak', lambda: torch.cuda.max_memory_allocated(0)),
+        ('total', lambda: torch.cuda.get_device_properties(0).total_memory)]
+    for name, getter in metrics:
+        try:
+            value = getter()
+            if type(value) is int and 0 <= value <= 128 * 1024**3:
+                fields.append(name + '_mib=' + str(round(value / 1024**2, 3)))
+        except Exception:
+            pass
+    if fields:
+        print('recipe_gpu stage=' + stage + ' ' + ' '.join(fields), flush=True)
+
+
 class Models:
     """Only one LLM, VLM or ASR is resident at a time; retain across equal jobs."""
     def __init__(self, config, schema, rules, root, deadline):
         self.config, self.schema, self.rules = config, schema, rules
         self.root, self.deadline = root, deadline
         self.kind = self.model = self.processor = None
+        self.llm_name = model_name(config.get('llm_model'), QWEN3_AWQ_MODEL)
 
     def unload(self):
         self.model = self.processor = None
@@ -509,7 +558,8 @@ class Models:
 
     def load(self, kind):
         four_bit = self.config.get('llm_load_in_4bit', True)
-        if kind == 'llm' and type(four_bit) is not bool:
+        awq = self.llm_name == QWEN3_AWQ_MODEL
+        if kind == 'llm' and not awq and type(four_bit) is not bool:
             raise AppError('invalid_model', 'llm_load_in_4bitにはbooleanを指定してください。')
         if self.kind == kind:
             return
@@ -520,14 +570,26 @@ class Models:
             'use_safetensors': True, 'torch_dtype': torch.float16,
             'device_map': {'': 'cuda:0'}, 'attn_implementation': 'sdpa'}
         if kind == 'llm':
-            name = model_name(self.config.get('llm_model'), 'Qwen/Qwen2.5-7B-Instruct')
+            name = self.llm_name
             options = dict(common)
-            if four_bit:
+            if awq:
+                from transformers import AwqConfig
+                options['quantization_config'] = AwqConfig(bits=4, group_size=128,
+                    zero_point=True, version='gemm', backend='autoawq', do_fuse=False)
+            elif four_bit:
                 from transformers import BitsAndBytesConfig
                 options['quantization_config'] = BitsAndBytesConfig(load_in_4bit=True,
                     bnb_4bit_quant_type='nf4', bnb_4bit_compute_dtype=torch.float16)
             self.processor = AutoTokenizer.from_pretrained(name, trust_remote_code=False, cache_dir=common['cache_dir'])
-            self.model = AutoModelForCausalLM.from_pretrained(name, **options)
+            started = time.monotonic()
+            try:
+                torch.cuda.reset_peak_memory_stats(0)
+            except Exception:
+                pass
+            try:
+                self.model = AutoModelForCausalLM.from_pretrained(name, **options)
+            finally:
+                safe_gpu_diagnostic(torch, 'load', time.monotonic() - started)
         elif kind == 'vlm':
             name = model_name(self.config.get('vlm_model'), 'Qwen/Qwen2.5-VL-3B-Instruct')
             self.processor = AutoProcessor.from_pretrained(name, trust_remote_code=False,
@@ -560,19 +622,34 @@ class Models:
             inputs = self.processor(text=[text], images=image_inputs, padding=True, return_tensors='pt').to('cuda:0')
         else:
             messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            chat_options = {'enable_thinking': False} if self.llm_name == QWEN3_AWQ_MODEL else {}
+            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **chat_options)
             inputs = self.processor([text], return_tensors='pt').to('cuda:0')
         tokens = inputs['input_ids'].shape[-1]
-        if tokens > 24000:
+        awq = not images and self.llm_name == QWEN3_AWQ_MODEL
+        if tokens > (12000 if awq else 24000):
             raise AppError('input_too_large', 'model入力上限を超えています。本文を短くしてください。')
         remaining = self.deadline - time.time()
         if remaining < 30:
             raise BatchTimeout()
         safe_runtime_diagnostic(torch, tokens)
-        generation_seconds = 600 if template.get('source', {}).get('type') == 'youtube' and tokens >= 4000 else 360
-        with torch.inference_mode(), (nullcontext() if images else t4_efficient_sdpa()):
-            output = self.model.generate(**inputs, max_new_tokens=6144, do_sample=False,
-                max_time=min(generation_seconds, remaining - 20))
+        long_youtube = template.get('source', {}).get('type') == 'youtube' and tokens >= 4000
+        generation_seconds = (900 if long_youtube else 600) if awq else (600 if long_youtube else 360)
+        sampling = {'do_sample': True, 'temperature': 0.7, 'top_p': 0.8,
+            'top_k': 20, 'min_p': 0.0} if awq else {'do_sample': False}
+        if awq:
+            torch.manual_seed(AWQ_SAMPLING_SEED)
+        started = time.monotonic()
+        try:
+            torch.cuda.reset_peak_memory_stats(0)
+        except Exception:
+            pass
+        try:
+            with torch.inference_mode(), (nullcontext() if images else t4_efficient_sdpa()), (awq_gpu_dequant() if awq else nullcontext()):
+                output = self.model.generate(**inputs, max_new_tokens=6144, **sampling,
+                    max_time=min(generation_seconds, remaining - 20))
+        finally:
+            safe_gpu_diagnostic(torch, 'generate', time.monotonic() - started)
         generated = output[0, tokens:]
         safe_runtime_diagnostic(torch, tokens, generated.shape[-1])
         decoder = self.processor.tokenizer if images else self.processor
@@ -699,6 +776,8 @@ def job_failure_frame(error):
     """Only fixed function labels, never filenames, locals or traceback text."""
     frame_labels = {'transcribe': 'transcribe', 'append_transcript': 'append_transcript',
         'evidence': 'evidence', 'decode_audio': 'decode_audio', 'download_model': 'download_model',
+        'enforce_evidence': 'enforce_evidence', 'snapshot_download': 'snapshot_download',
+        'hf_hub_download': 'hf_hub_download', '_inner_fn': 'hub_wrapper',
         'get_speech_timestamps': 'get_speech_timestamps', 'get_vad_model': 'get_vad_model',
         'generate_segments': 'generate_segments', 'generate_with_fallback': 'generate_with_fallback',
         'detect_language': 'detect_language', 'encode': 'encode', 'generate': 'generate',

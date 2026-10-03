@@ -1,7 +1,7 @@
 """CPU-only contract tests. Models, network and Kaggle submission are mocked."""
 import datetime as dt
 import copy
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 import enum
 import importlib.util
 import io
@@ -27,6 +27,15 @@ def claim():
 
 
 class LauncherTests(unittest.TestCase):
+    def test_notebook_bundle_pins_pyav_compatible_with_faster_whisper_decode(self):
+        import base64
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(launcher.generic_bundle()))) as bundle:
+            requirements = bundle.read('requirements-worker.txt').decode('utf-8')
+        av_requirements = [line.strip() for line in requirements.splitlines()
+            if line.strip().startswith(('av==', 'av>=', 'av<', 'av~=', 'av!='))]
+        self.assertEqual(av_requirements, ['av==18.1.0'])
+
     def test_public_repository_only(self):
         with patch.object(launcher, 'request_json', return_value={'private': True, 'visibility': 'private'}):
             with self.assertRaisesRegex(launcher.LaunchError, 'public_repository_required'):
@@ -218,45 +227,74 @@ class WorkerTests(unittest.TestCase):
             entries.append('entered')
             yield
         torch = types.SimpleNamespace(inference_mode=inference, __version__='2.8.0',
-            cuda=types.SimpleNamespace(get_device_capability=lambda _: (7, 5)))
+            manual_seed=Mock(), cuda=types.SimpleNamespace(get_device_capability=lambda _: (7, 5)))
+        chat_calls = []
         class Processor:
             @property
             def tokenizer(self): return self
-            def apply_chat_template(self, *args, **kwargs): return 'mock input'
+            def apply_chat_template(self, *args, **kwargs):
+                chat_calls.append(kwargs)
+                return 'mock input'
             def __call__(self, *args, **kwargs): return Inputs(input_ids=types.SimpleNamespace(shape=(1, token_count)))
             def decode(self, *args, **kwargs): return '{"title":{"original":"料理"},"ingredients":[],"steps":[]}'
-        cases = [('youtube', 3999, 1000, [], 360), ('youtube', 4000, 1000, [], 600),
-            ('youtube', 6746, 500, [], 480), ('web', 6746, 1000, [], 360),
-            ('text', 4000, 1000, [], 360), ('image', 4996, 1000,
-                [{'path': 'unused.jpg', 'ref_id': 'src_001'}], 360)]
-        for source_type, token_count, remaining, images, expected_seconds in cases:
+        cases = [(worker.NF4_MODEL, 'youtube', 3999, 1000, [], 360),
+            (worker.NF4_MODEL, 'youtube', 4000, 1000, [], 600),
+            (worker.NF4_MODEL, 'youtube', 6746, 500, [], 480),
+            (worker.NF4_MODEL, 'web', 6746, 1000, [], 360),
+            (worker.NF4_MODEL, 'text', 24000, 1000, [], 360),
+            (worker.QWEN3_AWQ_MODEL, 'image', 4996, 1000,
+                [{'path': 'unused.jpg', 'ref_id': 'src_001'}], 360),
+            (worker.QWEN3_AWQ_MODEL, 'text', 12000, 1000, [], 600),
+            (worker.QWEN3_AWQ_MODEL, 'youtube', 3999, 1000, [], 600),
+            (worker.QWEN3_AWQ_MODEL, 'youtube', 4000, 1000, [], 900),
+            (worker.QWEN3_AWQ_MODEL, 'youtube', 6746, 700, [], 680),
+            (worker.QWEN3_AWQ_MODEL, 'text', 12001, 1000, [], None),
+            (worker.NF4_MODEL, 'text', 24001, 1000, [], None)]
+        for model_name, source_type, token_count, remaining, images, expected_seconds in cases:
             with self.subTest(source=source_type, tokens=token_count, remaining=remaining):
-                models = worker.Models({}, {}, 'rules', Path('.'), 1000 + remaining)
+                models = worker.Models({'llm_model': model_name}, {}, 'rules', Path('.'), 1000 + remaining)
                 generate = Mock(return_value=Output())
                 models.model = types.SimpleNamespace(generate=generate)
                 models.processor = Processor()
                 template = {key: 'fixed' for key in ['recipe_id', 'schema_version', 'created_at', 'updated_at']}
                 template['source'] = {'type': source_type}
                 before = len(entries)
-                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), patch.object(worker.time, 'time', return_value=1000), redirect_stdout(io.StringIO()):
+                with patch.dict(sys.modules, {'torch': torch, 'qwen_vl_utils': types.SimpleNamespace(process_vision_info=lambda _: ([], None))}), patch.object(models, 'load'), patch.object(worker, 'build_structure_prompts', return_value=('rules', 'prompt')), patch.object(worker, 't4_efficient_sdpa', efficient), patch.object(worker, 'awq_gpu_dequant', nullcontext), patch.object(worker.time, 'time', return_value=1000), redirect_stdout(io.StringIO()):
+                    if expected_seconds is None:
+                        with self.assertRaises(AppError) as error:
+                            models.structure({'images': images, 'evidence': []}, template)
+                        self.assertEqual(error.exception.code, 'input_too_large')
+                        generate.assert_not_called()
+                        continue
                     models.structure({'images': images, 'evidence': []}, template)
                 self.assertEqual(len(entries) - before, 0 if images else 1)
                 self.assertEqual(generate.call_args.kwargs['max_time'], expected_seconds)
                 self.assertEqual(generate.call_args.kwargs['max_new_tokens'], 6144)
+                awq = model_name == worker.QWEN3_AWQ_MODEL and not images
+                self.assertEqual(generate.call_args.kwargs['do_sample'], awq)
+                if awq:
+                    self.assertIs(chat_calls[-1]['enable_thinking'], False)
+                    self.assertEqual({k: generate.call_args.kwargs[k] for k in
+                        ['temperature', 'top_p', 'top_k', 'min_p']},
+                        {'temperature': 0.7, 'top_p': 0.8, 'top_k': 20, 'min_p': 0.0})
+                    torch.manual_seed.assert_called_with(42)
+                else:
+                    self.assertNotIn('enable_thinking', chat_calls[-1])
 
     def fake_model_modules(self):
         torch = types.SimpleNamespace(float16='mock-fp16', cuda=types.SimpleNamespace(
             is_available=lambda: True, empty_cache=Mock()))
         transformer = types.SimpleNamespace(BitsAndBytesConfig=Mock(return_value='mock-nf4'),
+            AwqConfig=Mock(return_value='mock-awq'),
             AutoTokenizer=types.SimpleNamespace(from_pretrained=Mock(return_value='mock-tokenizer')),
             AutoProcessor=types.SimpleNamespace(from_pretrained=Mock(return_value='mock-processor')),
             AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=Mock(return_value=types.SimpleNamespace(eval=Mock()))),
             Qwen2_5_VLForConditionalGeneration=types.SimpleNamespace(from_pretrained=Mock(return_value=types.SimpleNamespace(eval=Mock()))))
         return torch, transformer
 
-    def test_default_llm_nf4_and_vlm_fp16_release_previous_model(self):
+    def test_rollback_llm_nf4_and_vlm_fp16_release_previous_model(self):
         torch, transformers = self.fake_model_modules()
-        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        models = worker.Models({'llm_model': worker.NF4_MODEL}, {}, 'rules', Path('.'), 10000)
         with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}):
             models.load('llm')
             transformers.BitsAndBytesConfig.assert_called_once_with(load_in_4bit=True,
@@ -282,9 +320,85 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(models.kind, 'vlm')
             self.assertEqual(torch.cuda.empty_cache.call_count, 2)
 
+    def test_default_awq_load_keeps_quantized_weights_on_cuda_without_bnb(self):
+        torch, transformers = self.fake_model_modules()
+        models = worker.Models({'llm_load_in_4bit': True}, {}, 'rules', Path('.'), 10000)
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), redirect_stdout(io.StringIO()):
+            models.load('llm')
+        transformers.AwqConfig.assert_called_once_with(bits=4, group_size=128,
+            zero_point=True, version='gemm', backend='autoawq', do_fuse=False)
+        transformers.BitsAndBytesConfig.assert_not_called()
+        loaded = transformers.AutoModelForCausalLM.from_pretrained.call_args
+        self.assertEqual(loaded.args, ('Qwen/Qwen3-14B-AWQ',))
+        self.assertEqual(loaded.kwargs['quantization_config'], 'mock-awq')
+        self.assertEqual(loaded.kwargs['device_map'], {'': 'cuda:0'})
+        self.assertFalse(loaded.kwargs['trust_remote_code'])
+        self.assertTrue(loaded.kwargs['use_safetensors'])
+        self.assertEqual(loaded.kwargs['attn_implementation'], 'sdpa')
+        self.assertEqual(loaded.kwargs['torch_dtype'], 'mock-fp16')
+
+    def test_awq_load_failure_has_no_nf4_or_cpu_retry(self):
+        torch, transformers = self.fake_model_modules()
+        transformers.AutoModelForCausalLM.from_pretrained.side_effect = RuntimeError('private-token')
+        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        output = io.StringIO()
+        with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), redirect_stdout(output), self.assertRaises(RuntimeError):
+            models.load('llm')
+        self.assertEqual(transformers.AutoModelForCausalLM.from_pretrained.call_count, 1)
+        transformers.BitsAndBytesConfig.assert_not_called()
+        self.assertIsNone(models.model)
+        self.assertIsNone(models.kind)
+        self.assertNotIn('private-token', output.getvalue())
+
+    def test_awq_dequant_path_is_explicit_and_restored_after_success_or_failure(self):
+        extension = object()
+        module = types.SimpleNamespace(awq_ext=extension, TRITON_AVAILABLE=True,
+            user_has_been_warned=False, dequantize_gemm=Mock(return_value='GPU weight'))
+        for fail in [False, True]:
+            with self.subTest(fail=fail), patch.dict(sys.modules, {'awq.modules.linear.gemm': module}):
+                try:
+                    with worker.awq_gpu_dequant():
+                        self.assertIsNone(module.awq_ext)
+                        self.assertFalse(module.TRITON_AVAILABLE)
+                        self.assertTrue(module.user_has_been_warned)
+                        self.assertEqual(module.dequantize_gemm(), 'GPU weight')
+                        if fail:
+                            raise RuntimeError('private-token')
+                except RuntimeError:
+                    self.assertTrue(fail)
+                self.assertIs(module.awq_ext, extension)
+                self.assertTrue(module.TRITON_AVAILABLE)
+                self.assertFalse(module.user_has_been_warned)
+        with patch.dict(sys.modules, {'awq.modules.linear.gemm': types.SimpleNamespace()}), self.assertRaises(AppError) as error:
+            with worker.awq_gpu_dequant():
+                self.fail('Missing AWQ symbols must fail before generation')
+        self.assertEqual(error.exception.code, 'model_api_incompatible')
+
+    def test_gpu_diagnostic_emits_only_bounded_numbers_and_fixed_stages(self):
+        mib = 1024**2
+        cuda = types.SimpleNamespace(memory_allocated=lambda _: 123*mib,
+            memory_reserved=lambda _: 234*mib, max_memory_allocated=lambda _: 345*mib,
+            get_device_properties=lambda _: types.SimpleNamespace(total_memory=15360*mib))
+        torch = types.SimpleNamespace(cuda=cuda)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            worker.safe_gpu_diagnostic(torch, 'load', 2.12345)
+        self.assertEqual(output.getvalue().strip(),
+            'recipe_gpu stage=load seconds=2.123 allocated_mib=123.0 reserved_mib=234.0 peak_mib=345.0 total_mib=15360.0')
+        cuda.memory_allocated = lambda _: 'private-token'
+        cuda.memory_reserved = lambda _: (_ for _ in ()).throw(RuntimeError('https://private.example'))
+        cuda.max_memory_allocated = lambda _: -1
+        cuda.get_device_properties = lambda _: types.SimpleNamespace(total_memory=129*1024**3)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            worker.safe_gpu_diagnostic(torch, 'generate', float('nan'))
+            worker.safe_gpu_diagnostic(torch, 'private-token', 1)
+            worker.safe_gpu_diagnostic(torch, 'generate', 'https://private.example')
+        self.assertEqual(output.getvalue(), '')
+
     def test_explicit_false_disables_quantization_without_a_fallback(self):
         torch, transformers = self.fake_model_modules()
-        models = worker.Models({'llm_load_in_4bit': False}, {}, 'rules', Path('.'), 10000)
+        models = worker.Models({'llm_model': worker.NF4_MODEL, 'llm_load_in_4bit': False}, {}, 'rules', Path('.'), 10000)
         with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}):
             models.load('llm')
         transformers.BitsAndBytesConfig.assert_not_called()
@@ -293,7 +407,7 @@ class WorkerTests(unittest.TestCase):
     def test_non_boolean_quantization_setting_fails_before_model_download(self):
         torch, transformers = self.fake_model_modules()
         for value in ['true', 1, 0, None]:
-            models = worker.Models({'llm_load_in_4bit': value}, {}, 'rules', Path('.'), 10000)
+            models = worker.Models({'llm_model': worker.NF4_MODEL, 'llm_load_in_4bit': value}, {}, 'rules', Path('.'), 10000)
             with self.subTest(value=value), patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), self.assertRaises(AppError):
                 models.load('llm')
         transformers.AutoTokenizer.from_pretrained.assert_not_called()
@@ -303,7 +417,7 @@ class WorkerTests(unittest.TestCase):
         torch, transformers = self.fake_model_modules()
         failure = RuntimeError('private-token quantization CUDA failure')
         transformers.AutoModelForCausalLM.from_pretrained.side_effect = failure
-        models = worker.Models({}, {}, 'rules', Path('.'), 10000)
+        models = worker.Models({'llm_model': worker.NF4_MODEL}, {}, 'rules', Path('.'), 10000)
         with patch.dict(sys.modules, {'torch': torch, 'transformers': transformers}), self.assertRaises(RuntimeError):
             models.load('llm')
         transformers.AutoModelForCausalLM.from_pretrained.assert_called_once()
@@ -563,6 +677,14 @@ class WorkerTests(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(AppError):
                 worker.parse_json(raw)
 
+    def test_thinking_tags_are_rejected_without_stripping_raw_output(self):
+        for raw in ['<think>推論</think>{"title":null}', '<think></think>{"title":null}',
+                '{"title":null}</think>', '```json\n<think>推論</think>{}\n```']:
+            with self.subTest(raw=raw), self.assertRaises(AppError) as error:
+                worker.parse_json(raw)
+            self.assertEqual(error.exception.code, 'llm_not_json')
+            self.assertEqual(error.exception.details['raw_output'], raw)
+
     def test_gpu_absent_never_runs_cpu(self):
         fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: False))
         with patch.dict(sys.modules, {'torch': fake_torch}), self.assertRaisesRegex(AppError, '無料T4'):
@@ -787,6 +909,25 @@ class WorkerTests(unittest.TestCase):
                 worker.safe_job_diagnostic('asr', error)
             self.assertTrue(output.getvalue().strip().endswith('last_frame=other'))
             self.assertNotIn('private', output.getvalue())
+
+    def test_evidence_and_hub_frame_labels_never_expose_paths_or_error_values(self):
+        labels = {'enforce_evidence': 'enforce_evidence', 'snapshot_download': 'snapshot_download',
+            'hf_hub_download': 'hf_hub_download', '_inner_fn': 'hub_wrapper',
+            'download_model': 'download_model', 'snapshot_download_private_token': 'other'}
+        for function, label in labels.items():
+            scope = {}
+            source = 'def ' + function + '():\n raise TypeError("unexpected keyword argument private-token https://private.example/input")'
+            exec(compile(source, 'C:/private-token/private-input-file.py', 'exec'), scope)
+            output = io.StringIO()
+            with self.subTest(function=function), redirect_stdout(output):
+                try:
+                    scope[function]()
+                except TypeError as error:
+                    worker.safe_job_diagnostic('asr', error)
+            self.assertEqual(output.getvalue().strip(),
+                'recipe_job_diag stage=asr exception=TypeError reason=api_signature last_frame=' + label)
+            for forbidden in ['private-token', 'https://', 'C:/', 'private-input-file', 'Traceback']:
+                self.assertNotIn(forbidden, output.getvalue())
 
     def test_transcribe_uses_official_gpu_signature_and_consumes_segment_generator(self):
         calls = []
