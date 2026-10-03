@@ -14,7 +14,8 @@ YouTubeは概要欄と字幕から先に候補を作ります。料理名、材�
 
 LLM生成中はT4でefficient SDPAだけを使います。固定したTransformersのK/V展開経路を一時的に使い、GQAが大きなメモリを使うmath方式へ進むのを防ぎます。処理後は設定を戻します。対応しない環境では`model_api_incompatible`として停止します。原典の切り捨てや別GPUへの切り替えはありません。
 
-`python -m unittest discover -s tests -v`で57件すべて合格しました。テストではmodelの取得と推論をmockしています。7BのNF4構成は実際のKaggle T4で文字・画像の候補を返しましたが、YouTubeのメモリ不足と出力形式の誤りが残りました。efficient SDPAと出力指示の修正は実GPU検証中です。NotebookへのSecrets登録はKaggle CLIで対応していないため、今回の短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
+`python -m unittest discover -s tests -v`で60件すべて合格しました。テストではmodelの取得と推論をmockしています。7BのNF4とefficient SDPAは実際のKaggle T4で動き、text 2件とimage 1件がSchemaに適合した候補を返しました。原文・単位・火加減の誤りは人の確認が必要です。候補の不正な参照型は保持してSchemaレビューへ渡し、4,000 token以上のYouTubeだけ生成上限を600秒とします。残り時間と6144 tokenの出力上限は維持します。この追加修正の実GPU検証は日次上限で待機しています。YouTubeのASR互換性エラーは診断中です。NotebookへのSecrets登録はKaggle CLIで対応していないため、今回の短期tokenはprivate sourceへ注入します。[Kaggle公式CLI仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels.md)と[metadata仕様](https://github.com/Kaggle/kaggle-cli/blob/main/docs/kernels_metadata.md)に合わせています。
 
 Colabで手動デバッグするときは同じworker codeを一時環境に置きます。自動起動や常駐機能はありません。
+
 

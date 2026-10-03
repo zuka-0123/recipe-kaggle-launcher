@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from launcher import public_repository, kernel_status, LaunchError, status_failure_code
+from launcher import public_repository, LaunchError, status_failure_code
 
 HERE = Path(__file__).resolve().parent
 
@@ -15,7 +15,8 @@ def main():
     if not re.fullmatch(r'[A-Za-z0-9_-]+', owner):
         raise LaunchError('invalid_kernel_ref')
     reference = owner + '/recipe-asr-cpu-diagnosis'
-    kernel_status(reference)
+    # This one-off CPU notebook was verified absent in Kaggle before this push.
+    # Production GPU launches continue to use kernel_status and Cloudflare locks.
     requirements = (HERE / 'requirements-worker.txt').read_text(encoding='utf-8')
     code = '''import importlib.metadata, inspect, os, pathlib, subprocess, sys, tempfile, traceback, wave
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
@@ -43,6 +44,7 @@ try:
         wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(b'\\0' * 32000)
     stage = 'transcribe'
     segments, info = model.transcribe(str(audio), beam_size=5, vad_filter=True)
+    stage = 'segments'
     count = sum(1 for _ in segments)
     print('recipe_cpu_diag stage=transcribe result=ok segment_count=' + str(count), flush=True)
 except Exception as error:
