@@ -30,9 +30,47 @@ try:
     if installed.returncode:
         raise RuntimeError('dependency_install_failed')
     import torch
-    from worker import Models, t4_efficient_sdpa, awq_gpu_dequant, safe_job_diagnostic
+    from contextlib import contextmanager, redirect_stdout, redirect_stderr
+    import importlib
+    from worker import Models, t4_efficient_sdpa, ensure_awq_import_compat, safe_job_diagnostic
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (7,5):
         raise RuntimeError('free_t4_required')
+    stage = 'kernel_check'
+    ensure_awq_import_compat()
+    gemm = importlib.import_module('awq.modules.linear.gemm')
+    if gemm.TRITON_AVAILABLE is not True or not callable(getattr(gemm,'awq_gemm_triton',None)) or not callable(getattr(gemm,'awq_dequantize_triton',None)):
+        raise RuntimeError('triton_awq_unavailable')
+    from awq.utils.packing_utils import dequantize_gemm
+    @contextmanager
+    def preflight_triton_awq():
+        original = (gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned)
+        try:
+            gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = None, True, True
+            # Compiler failures may print paths or code. Keep them out of Notebook logs.
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                yield
+        finally:
+            gemm.awq_ext, gemm.TRITON_AVAILABLE, gemm.user_has_been_warned = original
+    torch.manual_seed(42)
+    qweight = torch.randint(-(2**31),2**31,(512,32),device='cuda:0',dtype=torch.int32)
+    qzeros = torch.randint(-(2**31),2**31,(4,32),device='cuda:0',dtype=torch.int32)
+    scales = (torch.rand((4,256),device='cuda:0',dtype=torch.float16)+0.5)*0.05
+    reference = dequantize_gemm(qweight,qzeros,scales,4,128)
+    started = time.monotonic()
+    with torch.inference_mode(), preflight_triton_awq():
+        restored = gemm.awq_dequantize_triton(qweight,scales,qzeros)
+        torch.testing.assert_close(restored,reference,rtol=0.001,atol=0.001)
+        maximum_error = 0.0
+        for rows in [1,16]:
+            matrix = torch.randn((rows,512),device='cuda:0',dtype=torch.float16)
+            result = gemm.awq_gemm_triton(matrix,qweight,scales,qzeros,split_k_iters=8)
+            expected = torch.matmul(matrix,reference)
+            torch.testing.assert_close(result,expected,rtol=0.02,atol=0.1)
+            maximum_error = max(maximum_error,float((result-expected).abs().max().item()))
+        torch.cuda.synchronize(0)
+    print('recipe_preflight stage=kernel_check result=ok seconds=' + str(round(time.monotonic()-started,3)) + ' max_abs_error=' + str(round(maximum_error,6)),flush=True)
+    del qweight,qzeros,scales,reference,restored,matrix,result,expected
+    gc.collect(); torch.cuda.empty_cache()
     model = Models({'llm_model':'Qwen/Qwen3-14B-AWQ'}, {}, '', root, time.time()+3600)
     stage = 'load'
     started = time.monotonic()
@@ -40,10 +78,12 @@ try:
     print('recipe_preflight stage=load result=ok seconds=' + str(round(time.monotonic()-started,1)), flush=True)
     tokenizer = model.processor
     prompt = 'Return exactly this JSON object without explanation: {"ok":true,"unknown":null}'
-    for long_context in [False, True]:
-        stage = 'generate'
-        context = ('This diagnostic document contains no recipe facts. Unknown values remain null.\\n' * 700) if long_context else ''
-        messages = [{'role':'system','content':'Return only the requested JSON. Do not use thinking.'}, {'role':'user','content':context + prompt}]
+    for check in ['short_json','decode_128','long_json']:
+        stage = 'decode' if check == 'decode_128' else 'generate'
+        context = ('This diagnostic document contains no recipe facts. Unknown values remain null.\\n' * 700) if check == 'long_json' else ''
+        request = 'Continue writing the word sample separated by spaces. Do not stop early. No explanations.' if check == 'decode_128' else context + prompt
+        system = 'Do not use thinking. Follow the requested output format.' if check == 'decode_128' else 'Return only the requested JSON. Do not use thinking.'
+        messages = [{'role':'system','content':system}, {'role':'user','content':request}]
         text = tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True,enable_thinking=False)
         inputs = tokenizer([text],return_tensors='pt').to('cuda:0')
         count = inputs['input_ids'].shape[-1]
@@ -52,17 +92,23 @@ try:
         torch.cuda.reset_peak_memory_stats(0)
         torch.manual_seed(42)
         started = time.monotonic()
-        with torch.inference_mode(), t4_efficient_sdpa(), awq_gpu_dequant():
-            output = model.model.generate(**inputs,max_new_tokens=128,do_sample=True,temperature=0.7,top_p=0.8,top_k=20,min_p=0.0,max_time=300)
+        options = {'min_new_tokens':128} if check == 'decode_128' else {}
+        with torch.inference_mode(), t4_efficient_sdpa(), preflight_triton_awq():
+            output = model.model.generate(**inputs,max_new_tokens=128,do_sample=True,temperature=0.7,top_p=0.8,top_k=20,min_p=0.0,max_time=600 if check == 'decode_128' else 300,**options)
+        torch.cuda.synchronize(0)
+        elapsed = time.monotonic()-started
         raw = tokenizer.decode(output[0,count:],skip_special_tokens=True)
-        valid = json.loads(raw) == {'ok':True,'unknown':None} and '<think>' not in raw
-        print('recipe_preflight stage=generate input_tokens=' + str(count) + ' output_tokens=' + str(output.shape[-1]-count) + ' seconds=' + str(round(time.monotonic()-started,1)) + ' valid_json=' + str(valid).lower() + ' allocated_mib=' + str(round(torch.cuda.memory_allocated(0)/1048576)) + ' reserved_mib=' + str(round(torch.cuda.memory_reserved(0)/1048576)) + ' peak_mib=' + str(round(torch.cuda.max_memory_allocated(0)/1048576)) + ' total_mib=' + str(round(torch.cuda.get_device_properties(0).total_memory/1048576)),flush=True)
+        valid = (output.shape[-1]-count == 128) if check == 'decode_128' else json.loads(raw) == {'ok':True,'unknown':None}
+        valid = valid and '<think>' not in raw and '</think>' not in raw
+        print('recipe_preflight stage=' + stage + ' input_tokens=' + str(count) + ' output_tokens=' + str(output.shape[-1]-count) + ' seconds=' + str(round(elapsed,1)) + ' tokens_per_second=' + str(round((output.shape[-1]-count)/elapsed,3)) + ' valid=' + str(valid).lower() + ' allocated_mib=' + str(round(torch.cuda.memory_allocated(0)/1048576)) + ' reserved_mib=' + str(round(torch.cuda.memory_reserved(0)/1048576)) + ' peak_mib=' + str(round(torch.cuda.max_memory_allocated(0)/1048576)) + ' total_mib=' + str(round(torch.cuda.get_device_properties(0).total_memory/1048576)),flush=True)
+        if not valid:
+            raise RuntimeError('preflight_output_invalid')
         del inputs, output
         gc.collect(); torch.cuda.empty_cache()
     model.unload()
 except Exception as error:
     if 'safe_job_diagnostic' in locals():
-        safe_job_diagnostic('structure' if stage == 'generate' else 'extract',error)
+        safe_job_diagnostic('structure' if stage in ['generate','decode'] else 'extract',error)
     print('recipe_preflight stage=' + stage + ' result=failed exception=' + type(error).__name__,flush=True)
 finally:
     shutil.rmtree(root,ignore_errors=True)
