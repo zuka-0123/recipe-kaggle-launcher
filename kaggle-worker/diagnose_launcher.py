@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
-from launcher import public_repository, kernel_status, LaunchError
+from launcher import public_repository, kernel_status, LaunchError, status_failure_code
 
 HERE = Path(__file__).resolve().parent
 
@@ -68,12 +68,17 @@ finally:
         (directory / 'kernel-metadata.json').write_text(json.dumps(metadata), encoding='utf-8')
         result = subprocess.run(['kaggle','kernels','push','-p',str(directory),'--timeout','1200'], capture_output=True,text=True,timeout=180)
         if result.returncode or not re.search(r'Kernel version(?: \d+)? successfully pushed\.', result.stdout or ''):
+            print('CPU push status: ' + status_failure_code((result.stdout or '') + '\n' + (result.stderr or '')))
             raise LaunchError('cpu_diagnosis_launch_failed')
     print('Private CPU diagnosis submitted; no GPU, batch or recipe access.')
 
 if __name__ == '__main__':
     try:
         main()
-    except Exception:
+    except LaunchError as error:
+        print('CPU diagnosis launcher stopped: ' + error.code)
+        raise SystemExit(1) from None
+    except Exception as error:
+        print('CPU diagnosis exception type: ' + type(error).__name__)
         print('CPU diagnosis launcher stopped.')
         raise SystemExit(1) from None
