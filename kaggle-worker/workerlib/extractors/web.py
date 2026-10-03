@@ -42,8 +42,9 @@ def parse_web(html, max_chars, recipe_index=0):
     if selected:
         items.append(evidence('src_001', 'web_structured_data', json.dumps(selected, ensure_ascii=False)))
     complete = selected and selected.get('recipeIngredient') and selected.get('recipeInstructions')
-    if not complete:
-        # Recipeが揃っているページでは本文を混ぜず、関連記事の材料混入を避けます。
+    if not complete or (len(recipes) == 1 and not selected.get('recipeYield')):
+        # 材料・手順が揃っていても、人数は本文だけに記載される場合があります。
+        # 複数Recipeのページでは、選んでいない料理の本文を混ぜません。
         for element in soup.select('script, style, nav, aside, footer, header, form, [role="navigation"], [role="complementary"], .advertisement, .ads, .related'):
             element.decompose()
         body = trafilatura.extract(str(soup), include_comments=False, include_tables=True, favor_precision=True)

@@ -144,6 +144,17 @@ class LauncherTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_web_missing_yield_keeps_japanese_recipe_body_and_excludes_ads(self):
+        from workerlib.extractors.web import parse_web
+        recipe = {'@type': 'Recipe', 'name': '白がゆ', 'recipeIngredient': ['米120ml', '水1リットル', 'ごま塩適量'],
+            'recipeInstructions': [{'@type': 'HowToStep', 'text': '炊く。'}]}
+        html = '<html><body><script type="application/ld+json">'+json.dumps(recipe, ensure_ascii=False)+'</script><main><article><h1>白がゆ</h1><h2>材料（2～3人分）</h2><p>米120ml、水1リットル、ごま塩適量。</p><p>米をとぎ、分量の水で25分間ほど炊きます。器に盛ってごま塩をかけます。</p></article></main><aside>広告の商品999g</aside></body></html>'
+        extraction = parse_web(html, 120000)
+        self.assertEqual(extraction['evidence'][0]['type'], 'web_structured_data')
+        self.assertEqual(extraction['evidence'][1]['type'], 'web_text')
+        self.assertIn('2～3人分', extraction['evidence'][1]['text'])
+        self.assertNotIn('広告の商品', extraction['evidence'][1]['text'])
+
     def fake_sdpa_modules(self, capability=(7, 5)):
         entered = []
         @contextmanager
